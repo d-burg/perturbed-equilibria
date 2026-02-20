@@ -1,20 +1,51 @@
 """
-Gaussian-process-regression (GPR) profile perturber
-====================================================
+GPR profile perturber and perturbed Grad-Shafranov equilibrium workflow
+=======================================================================
 
-Provides a class for generating smooth, spatially-correlated
-perturbations to 1-D MHD profiles (pressure, density, temperature,
-current density) on a normalised-flux grid, and a convenience
-wrapper for single-call usage.
-
-The primary user-facing input is ``sigma_profile`` — the
-experimental 1σ uncertainty **in the same units as the profile**.
+Provides:
+  - ``GPRProfilePerturber`` – Gaussian-process-regression based profile
+    perturbation class.
+  - ``generate_perturbed_GPR`` – convenience one-call wrapper.
+  - ``verify_gpr_statistics`` – Monte-Carlo validation of GPR sampling.
+  - ``new_uncertainty_profiles`` – builds 1-D uncertainty envelopes.
+  - ``perturb_kinetic_equilibrium`` – perturbs kinetic + current-density
+    profiles and iterates to match Ip and l_i targets via TokaMaker.
+  - ``generate_perturbed_equilibria`` – batch driver.
+  - ``initialize_equilibrium_database`` / ``store_equilibrium`` /
+    ``load_equilibrium`` – HDF5 archive helpers.
 """
+
+import io
+import os
+import time
+import tempfile
 
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import cdist
+from scipy import integrate
+from scipy.stats import norm
 from typing import Optional
+
+import h5py
+
+from .utils import (
+    initialize_equilibrium_database,
+    store_equilibrium,
+    load_equilibrium,
+)
+
+# OFT and scipy.optimize imports are deferred to perturb_kinetic_equilibrium
+# so the GPR half of this module works without OpenFUSIONToolkit installed.
+
+
+# ── physical constant used for pressure ────────────────────────────
+EC = 1.6022e-19  # [J/eV]
+
+# ── default iteration caps (safety valves) ─────────────────────────
+_MAX_PRESSURE_ITER = int(1e5)
+_MAX_LI_ITER = 20
+_MAX_MONOTONIC_DRAWS = int(1e4)
 
 
 # ====================================================================
@@ -151,7 +182,7 @@ def generate_perturbed_GPR(
     directly to the GP marginal standard deviation — no separate
     ``variance`` parameter is needed.
 
-    @param xdata          1-D normalised flux grid \f$ \hat\psi \f$
+    @param xdata          1-D normalised flux grid \f$ \hat{\psi} \f$
     @param profile        1-D baseline profile (GP mean)
     @param sigma_profile  1-D experimental 1\f$\sigma\f$ uncertainty
                           **in profile units**.  ``None`` → zero
@@ -236,12 +267,15 @@ def generate_perturbed_GPR(
         return perturbed[0]
     return perturbed
 
+
+# ====================================================================
+#  Statistics verification
+# ====================================================================
 def verify_gpr_statistics(
     psi_N,
     profile,
     uncertainty_prof,
     length_scale=0.25,
-    variance=0.1,
     n_verification=5000,
     confidence_band=2.0,
 ):
@@ -249,14 +283,14 @@ def verify_gpr_statistics(
 
     Draws a large number of samples and checks:
     1. Pointwise mean ≈ input profile  (bias check)
-    2. Pointwise std  ≈ u(x)·√variance (variance check)
+    2. Pointwise std  ≈ uncertainty_prof  (variance check)
     3. Fraction of samples outside ±kσ  ≈ theoretical  (tail check)
 
     @param psi_N             Normalised flux grid
     @param profile           Baseline profile (GP mean)
-    @param uncertainty_prof  Uncertainty envelope u(x)
+    @param uncertainty_prof  Experimental 1σ uncertainty envelope u(x)
+                             (same units as profile)
     @param length_scale      GPR length-scale
-    @param variance          GPR kernel amplitude
     @param n_verification    Number of Monte-Carlo draws
     @param confidence_band   Number of σ for the band (e.g. 2.0)
     @result dict with verification diagnostics
@@ -264,7 +298,6 @@ def verify_gpr_statistics(
     perturber = GPRProfilePerturber(
         kernel_func="rbf",
         length_scale=length_scale,
-        variance=variance,
     )
 
     rng = np.random.default_rng(42)
@@ -274,7 +307,8 @@ def verify_gpr_statistics(
     )                                          # (n_verification, n_points)
 
     # ---- theoretical predictions ------------------------------------
-    sigma_theory = perturber.marginal_std(uncertainty_prof)
+    # Marginal std equals sigma_profile exactly by construction
+    sigma_theory = uncertainty_prof
 
     # ---- empirical statistics ---------------------------------------
     empirical_mean = np.mean(samples, axis=0)
@@ -289,7 +323,6 @@ def verify_gpr_statistics(
     avg_exceedance = np.mean(exceedance_per_point)
 
     # ---- theoretical exceedance for a Gaussian ----------------------
-    from scipy.stats import norm
     theoretical_exceedance = 2.0 * norm.sf(confidence_band)  # two-tailed
 
     # ---- report -----------------------------------------------------
@@ -373,126 +406,76 @@ def verify_gpr_statistics(
         "theoretical_exceedance": theoretical_exceedance,
     }
 
-"""
-Perturbed Grad-Shafranov equilibrium workflow
-==============================================
 
-Functions for generating uncertainty envelopes, perturbing kinetic
-and current-density profiles via GPR sampling, and iterating to
-match target Ip and l_i within tolerance.
-"""
-
-import io
-import os
-import time
-import tempfile
-
-import numpy as np
-import matplotlib.pyplot as plt
-
-
-# ── physical constant used for pressure ────────────────────────────
-EC = 1.6022e-19  # [J/eV]
-
-# ── default iteration caps (safety valves) ─────────────────────────
-_MAX_PRESSURE_ITER = int(1e5)
-_MAX_LI_ITER = 20
-_MAX_MONOTONIC_DRAWS = int(1e4)
-
-import h5py
-import os
-
-from OpenFUSIONToolkit.TokaMaker.util import get_jphi_from_GS
-
+# ====================================================================
+#  Internal inductance proxy
+# ====================================================================
 def calc_cylindrical_li_proxy(j_phi_profile, psi_pad):
     """
     Calculates a proxy for internal inductance l_i(3) using 1D profiles.
-    
-    Parameters:
-    -----------
+
+    Parameters
+    ----------
     j_phi_profile : array-like
         The toroidal current density profile (perturbation target).
-    psi_N : array-like
-        Normalized poloidal flux (0 to 1).
-    ravgs_q : list of arrays
-        Result from get_q: [<R>, <1/R>, dV/dPsi].
-    psi_range : float
-        The scalar difference (psi_boundary - psi_axis) to un-normalize gradients.
-        
-    Returns:
-    --------
+    psi_pad : float
+        Padding inside the LCFS for profile queries.
+
+    Returns
+    -------
     li_proxy : float
         The estimated internal inductance.
     """
-    from scipy import integrate
-    
     n_psi = len(j_phi_profile)
 
-    psi_N,f,fp,p,pp = mygs.get_profiles(npsi=n_psi, psi_pad=psi_pad)
-    _,qvals,ravgs_q,dl,rbounds,zbounds = mygs.get_q(npsi=n_psi, psi_pad=psi_pad)
-    psi_range = mygs.psi_bounds[1] - mygs.psi_bounds[0] # psi bounds used to un-normalize psi_N
-    
-    # 1. Unpack Geometry from baseline
-    R_avg = ravgs_q[0]  
+    psi_N, f, fp, p, pp = mygs.get_profiles(npsi=n_psi, psi_pad=psi_pad)
+    _, qvals, ravgs_q, dl, rbounds, zbounds = mygs.get_q(npsi=n_psi, psi_pad=psi_pad)
+    psi_range = mygs.psi_bounds[1] - mygs.psi_bounds[0]
+
+    # 1. Unpack geometry from baseline
+    R_avg = ravgs_q[0]
     dV_dPsi = ravgs_q[2]
-    
+
     # 2. Calculate differentials
-    # d_psi_real corresponds to d_psi in the actual equilibrium
     grad_psi_N = np.gradient(psi_N)
     d_psi_real = grad_psi_N * psi_range
-    
-    # dV is the differential volume element
     dV = dV_dPsi * d_psi_real
-    
-    # 3. Calculate Geometry Mappings
-    # FIX: cumtrapz -> cumulative_trapezoid
+
+    # 3. Geometry mappings
     V_enc = integrate.cumulative_trapezoid(dV, initial=0)
     V_tot = V_enc[-1]
-    
-    # Effective minor radius r_eff
     r_eff = np.sqrt(np.abs(V_enc) / (2 * np.pi**2 * R_avg))
-    
-    # Differential Poloidal Area dA
     dA = dV / (2 * np.pi * R_avg)
-    
-    # 4. Calculate Enclosed Current I(rho)
+
+    # 4. Enclosed current I(rho)
     dI = j_phi_profile * dA
-    # FIX: cumtrapz -> cumulative_trapezoid
     I_enc = integrate.cumulative_trapezoid(dI, initial=0)
     I_tot = I_enc[-1]
-    
-    # 5. Calculate Cylindrical Poloidal Field Proxy B_p(rho)
+
+    # 5. Cylindrical poloidal field proxy B_p(rho)
     with np.errstate(divide='ignore', invalid='ignore'):
         B_p_proxy = I_enc / (2 * np.pi * r_eff)
-    
-    # Handle core singularity (limit r->0)
-    # If J(0) is finite, B_p is linear in r, so B_p(0) = 0.
-    B_p_proxy[0] = 0.0 
-    
-    # 6. Integrate Magnetic Energy
+    B_p_proxy[0] = 0.0  # core singularity: limit r→0
+
+    # 6. Integrate magnetic energy
     B_p_sq = B_p_proxy**2
-    
-    # FIX: np.trapz is also deprecated in NumPy 2.0 / SciPy 1.14
-    # Using scipy.integrate.trapezoid instead
     W_pol_integral = integrate.trapezoid(B_p_sq * dV)
-    
+
     # 7. Calculate l_i
     L_edge = 2 * np.pi * r_eff[-1]
-    
-    # Avoid div/0 if total current is 0
+
     if I_tot == 0:
         return 0.0
-        
+
     B_p_edge_avg = I_tot / L_edge
-    
-   # li_proxy = (2 * W_pol_integral) / (V_tot * B_p_edge_avg**2)
     li_proxy = W_pol_integral / (V_tot * B_p_edge_avg**2)
 
     return li_proxy
 
+
 # ====================================================================
-#  Uncertainty envelope builder. 
-#  This needs to be multiplied against your profile of choice to give σ(ψ_N)
+#  Uncertainty envelope builder.
+#  Multiply against your profile of choice to give σ(ψ_N).
 # ====================================================================
 def new_uncertainty_profiles(
     psi_N,
@@ -560,7 +543,6 @@ def new_uncertainty_profiles(
 # ====================================================================
 #  Helper: draw a monotonically-decreasing GPR perturbation
 # ====================================================================
-    
 def _draw_monotonic_perturbation(
     psi_N,
     normalised_profile,
@@ -675,7 +657,18 @@ def perturb_kinetic_equilibrium(
     '''
 
     # ----------------------------------------------------------------
-    #  0.  Validate inputs
+    #  0.  Lazy OFT imports (deferred so GPR-only use works without OFT)
+    # ----------------------------------------------------------------
+    from scipy.optimize import root_scalar
+    from OpenFUSIONToolkit.TokaMaker.util import get_jphi_from_GS
+    from OpenFUSIONToolkit.TokaMaker.bootstrap import (
+        solve_with_bootstrap,
+        find_optimal_scale,
+        Ip_flux_integral_vs_target,
+    )
+
+    # ----------------------------------------------------------------
+    #  1.  Validate inputs
     # ----------------------------------------------------------------
     if recalculate_j_BS and input_jinductive is None:
         raise ValueError(
@@ -683,7 +676,7 @@ def perturb_kinetic_equilibrium(
         )
 
     # ----------------------------------------------------------------
-    #  1.  Perturb kinetic profiles to match <P>
+    #  2.  Perturb kinetic profiles to match <P>
     # ----------------------------------------------------------------
     inp_avg = mygs.flux_integral(psi_N, pressure)
 
@@ -754,8 +747,9 @@ def perturb_kinetic_equilibrium(
         ax[1, 1].set_xlabel(r"$\hat{\psi}$")
         plt.tight_layout()
         plt.show()
+
     # ----------------------------------------------------------------
-    #  2.  Bootstrap-current recalculation (optional)
+    #  3.  Bootstrap-current recalculation (optional)
     # ----------------------------------------------------------------
     j0_scales = []
     Ip_scales = []
@@ -787,7 +781,7 @@ def perturb_kinetic_equilibrium(
         baseline_li_proxy = calc_cylindrical_li_proxy(input_j_phi, psi_pad)
 
     # ----------------------------------------------------------------
-    #  3.  l_i matching loop
+    #  4.  l_i matching loop
     # ----------------------------------------------------------------
     l_i = np.inf
     final_scale_j0 = 1.0
@@ -799,7 +793,7 @@ def perturb_kinetic_equilibrium(
     for li_iter in range(1, max_li_iter + 1):
         if abs(l_i - l_i_target) <= l_i_tolerance:
             break
-    
+
         # ---- 3a. Draw j_phi perturbation matching l_i proxy --------
         step_j_phi = (
             results["j_inductive"] if recalculate_j_BS else input_j_phi
@@ -904,7 +898,7 @@ def perturb_kinetic_equilibrium(
         R_avg = ravgs[0]
         one_over_R_avg = ravgs[1]
         output_jphi = get_jphi_from_GS(f * fp, pp, R_avg, one_over_R_avg)
-            
+
         if diagnostic_plots:
             fig, ax = plt.subplots(figsize=(5, 4))
             ax.plot(psi_N, matched_jphi_perturb, label=r"Input $j_\phi$")
@@ -953,7 +947,7 @@ def perturb_kinetic_equilibrium(
         )
 
     # ----------------------------------------------------------------
-    #  4.  Package outputs
+    #  5.  Package outputs
     # ----------------------------------------------------------------
     w_ExB = np.zeros_like(psi_N)  # placeholder – not yet computed
 
@@ -1043,7 +1037,7 @@ def generate_perturbed_equilibria(
     @result ``list[dict]`` – diagnostics from each equilibrium
     '''
     all_diagnostics = []
-    
+
     # self-consistent pressure for baseline <P>
     pressure = EC * (ne * te + ni * ti)
     npsi = len(pressure)
@@ -1087,7 +1081,7 @@ def generate_perturbed_equilibria(
 
         elapsed = time.perf_counter() - t_start
         print(f"  Wall-clock time: {elapsed:.1f} s")
-        
+
         diagnostics['time'] = elapsed
 
         # ---- save geqdsk to a temporary file, archive, delete -------
@@ -1130,190 +1124,3 @@ def generate_perturbed_equilibria(
         all_diagnostics.append(diagnostics)
 
     return all_diagnostics
-
-def initialize_equilibrium_database(header):
-    """
-    Create (or open) the top-level HDF5 database file on disk.
-
-    Parameters
-    ----------
-    header : str
-        Base name for the database.  File will be ``<header>.h5``.
-
-    Returns
-    -------
-    db_path : str
-        Absolute path to the HDF5 file.
-    """
-    db_path = os.path.abspath(f"{header}.h5")
-    with h5py.File(db_path, "a"):
-        pass
-    return db_path
-
-
-def _group_path(baseline, count):
-    """Return the internal HDF5 group path for a given entry."""
-    if baseline is not None:
-        return f"baseline_{int(baseline):03d}/{int(count)}"
-    return str(int(count))
-
-
-def _eqdsk_dataset_name(header, baseline, count):
-    """Return the dataset name used for the raw eqdsk bytes."""
-    if baseline is not None:
-        return f"{header}_{int(baseline):03d}_{int(count)}.eqdsk"
-    return f"{header}_{int(count)}.eqdsk"
-
-
-def store_equilibrium(
-    header,
-    count,
-    eqdsk_filepath,
-    psi_N,
-    j_phi,
-    j_BS,
-    j_inductive,
-    n_e,
-    T_e,
-    n_i,
-    T_i,
-    w_ExB,
-    li1,
-    li3,
-    baseline=None,
-):
-    """
-    Write one perturbed equilibrium into the HDF5 database.
-
-    Parameters
-    ----------
-    header : str
-        Base name (same string passed to ``initialize_equilibrium_database``).
-    count : int
-        Perturbation index (typically 0 – 15).
-    eqdsk_filepath : str
-        Path to the ``.geqdsk`` / ``.eqdsk`` file.  Read as raw bytes so
-        the Fortran-namelist formatting is preserved exactly.
-    psi_N, j_phi, j_BS, j_inductive,
-    n_e, T_e, n_i, T_i, w_ExB : array_like, 1-D
-        Profile arrays (see docstring of previous version for units).
-    li1 : float
-        Internal inductance l_i(1).
-    li3 : float
-        Internal inductance l_i(3).
-    baseline : int or None, optional
-        Scan-point index.  When provided an extra ``baseline_XXX/``
-        group layer is inserted so that many baselines coexist inside
-        one HDF5 file.  ``None`` (default) gives the flat layout.
-    """
-    db_path = os.path.abspath(f"{header}.h5")
-    if not os.path.isfile(db_path):
-        raise FileNotFoundError(
-            f"Database '{db_path}' not found.  "
-            f"Call initialize_equilibrium_database('{header}') first."
-        )
-
-    with open(eqdsk_filepath, "rb") as fh:
-        eqdsk_bytes = fh.read()
-
-    grp_path = _group_path(baseline, count)
-    ds_name  = _eqdsk_dataset_name(header, baseline, count)
-
-    with h5py.File(db_path, "a") as hf:
-        # clean slate if this entry already exists
-        if grp_path in hf:
-            del hf[grp_path]
-
-        grp = hf.create_group(grp_path)
-
-        # ---- raw eqdsk (opaque binary – bit-perfect) --------------------
-        grp.create_dataset(ds_name, data=np.void(eqdsk_bytes))
-
-        # ---- 1-D profiles -----------------------------------------------
-        grp.create_dataset("psi_N",               data=np.asarray(psi_N,       dtype=np.float64))
-        grp.create_dataset("j_phi [A/m^2]",       data=np.asarray(j_phi,       dtype=np.float64))
-        grp.create_dataset("j_BS [A/m^2]",        data=np.asarray(j_BS,        dtype=np.float64))
-        grp.create_dataset("j_inductive [A/m^2]", data=np.asarray(j_inductive, dtype=np.float64))
-        grp.create_dataset("n_e [m^-3]",          data=np.asarray(n_e,         dtype=np.float64))
-        grp.create_dataset("T_e [eV]",            data=np.asarray(T_e,         dtype=np.float64))
-        grp.create_dataset("n_i [m^-3]",          data=np.asarray(n_i,         dtype=np.float64))
-        grp.create_dataset("T_i [eV]",            data=np.asarray(T_i,         dtype=np.float64))
-        grp.create_dataset("w_ExB [rad/s]",       data=np.asarray(w_ExB,       dtype=np.float64))
-
-        # ---- scalars (group attributes) ----------------------------------
-        grp.attrs["l_i(1)"]   = float(li1)
-        grp.attrs["l_i(3)"]   = float(li3)
-        # bookkeeping – handy when browsing with h5dump / HDFView
-        if baseline is not None:
-            grp.attrs["baseline"] = int(baseline)
-        grp.attrs["count"] = int(count)
-
-
-def load_equilibrium(header, count, baseline=None, eqdsk_out_dir=None):
-    """
-    Retrieve one equilibrium entry from the HDF5 database.
-
-    Parameters
-    ----------
-    header : str
-        Base name of the database.
-    count : int
-        Perturbation index.
-    baseline : int or None, optional
-        Scan-point index (must match what was used at write time).
-    eqdsk_out_dir : str or None, optional
-        If given, the raw eqdsk is written to a file in this directory.
-
-    Returns
-    -------
-    result : dict
-        Keys: ``"eqdsk_filepath"``, ``"eqdsk_bytes"``,
-        the nine 1-D array names, ``"l_i(1)"``, ``"l_i(3)"``.
-    """
-    db_path  = os.path.abspath(f"{header}.h5")
-    grp_path = _group_path(baseline, count)
-    ds_name  = _eqdsk_dataset_name(header, baseline, count)
-
-    array_keys = [
-        "psi_N",
-        "j_phi [A/m^2]",
-        "j_BS [A/m^2]",
-        "j_inductive [A/m^2]",
-        "n_e [m^-3]",
-        "T_e [eV]",
-        "n_i [m^-3]",
-        "T_i [eV]",
-        "w_ExB [rad/s]",
-    ]
-
-    result = {}
-
-    with h5py.File(db_path, "r") as hf:
-        if grp_path not in hf:
-            raise KeyError(
-                f"Group '{grp_path}' not found in {db_path}"
-            )
-        grp = hf[grp_path]
-
-        # ---- eqdsk raw bytes -------------------------------------------
-        eqdsk_bytes = bytes(grp[ds_name][()])
-        result["eqdsk_bytes"] = eqdsk_bytes
-
-        if eqdsk_out_dir is not None:
-            os.makedirs(eqdsk_out_dir, exist_ok=True)
-            out_path = os.path.join(eqdsk_out_dir, ds_name)
-            with open(out_path, "wb") as fh:
-                fh.write(eqdsk_bytes)
-            result["eqdsk_filepath"] = os.path.abspath(out_path)
-        else:
-            result["eqdsk_filepath"] = None
-
-        # ---- 1-D arrays ------------------------------------------------
-        for key in array_keys:
-            result[key] = np.array(grp[key])
-
-        # ---- scalars ----------------------------------------------------
-        result["l_i(1)"] = float(grp.attrs["l_i(1)"])
-        result["l_i(3)"] = float(grp.attrs["l_i(3)"])
-
-    return result
