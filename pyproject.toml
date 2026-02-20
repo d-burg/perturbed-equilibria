@@ -1,12 +1,14 @@
 [build-system]
 requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "perturbed-equilibria"
 version = "0.1.0"
 description = "GP-sampled perturbed equilibria for uncertainty quantification with TokaMaker"
 requires-python = ">=3.9"
+readme = "README.md"
+license = {file = "LICENSE"}
 dependencies = [
     "numpy",
     "scipy",
@@ -17,6 +19,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["jupyter", "pytest"]
+
+[project.scripts]
+plot-family = "perturbed_equilibria.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

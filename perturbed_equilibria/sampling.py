@@ -32,6 +32,7 @@ import h5py
 from .utils import (
     initialize_equilibrium_database,
     store_equilibrium,
+    store_baseline_profiles,
     load_equilibrium,
 )
 
@@ -52,35 +53,37 @@ _MAX_MONOTONIC_DRAWS = int(1e4)
 #  GPR profile perturber
 # ====================================================================
 class GPRProfilePerturber:
-    r'''! Gaussian-process perturber for smooth 1-D MHD profiles.
+    r"""Gaussian-process perturber for smooth 1-D MHD profiles.
 
     Generates correlated random perturbations whose pointwise
     standard deviation is set **directly** by the user-supplied
-    \f$ \sigma(x) \f$ (experimental uncertainty in profile units).
+    :math:`\sigma(x)` (experimental uncertainty in profile units).
 
     Internally the kernel amplitude is fixed to unity so that
 
-    \f[
-        \operatorname{Cov}\!\bigl[\delta f(x),\,\delta f(x')\bigr]
-        \;=\;
-        \sigma(x)\;\sigma(x')\;
-        k_1\!\bigl(x,x'\bigr)
-    \f]
+    .. math::
 
-    where \f$ k_1 \f$ is the unit-variance base kernel and the
+        \operatorname{Cov}\!\bigl[\delta f(x),\,\delta f(x')\bigr]
+        = \sigma(x)\;\sigma(x')\; k_1\!\bigl(x,x'\bigr)
+
+    where :math:`k_1` is the unit-variance base kernel and the
     marginal standard deviation at every grid point equals the
     input uncertainty exactly:
 
-    \f[
-        \sigma_{\rm GP}(x) \;=\; \sigma(x)
-    \f]
+    .. math::
 
-    @param kernel_func   Kernel name: ``'rbf'`` (\f$ C^\infty \f$) or
-                         ``'matern52'`` (\f$ C^2 \f$).
-    @param length_scale  Correlation length in \f$ \hat\psi \f$ units.
-                         Controls *wiggliness* of the draws but does
-                         **not** affect the pointwise amplitude.
-    '''
+        \sigma_{\rm GP}(x) = \sigma(x)
+
+    Parameters
+    ----------
+    kernel_func : str
+        Kernel name: ``'rbf'`` (:math:`C^\infty`) or
+        ``'matern52'`` (:math:`C^2`).
+    length_scale : float
+        Correlation length in :math:`\hat\psi` units.
+        Controls *wiggliness* of the draws but does **not** affect
+        the pointwise amplitude.
+    """
 
     _ALLOWED_KERNELS = {"rbf", "matern52"}
 
@@ -105,12 +108,12 @@ class GPRProfilePerturber:
 
     # ---- unit-variance kernels --------------------------------------
     def _rbf_kernel(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
-        r'''! Squared-exponential kernel with unit variance.'''
+        r"""Squared-exponential kernel with unit variance."""
         d = cdist(X1.reshape(-1, 1), X2.reshape(-1, 1), "euclidean")
         return np.exp(-0.5 * (d / self.length_scale) ** 2)
 
     def _matern52_kernel(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
-        r'''! Matérn-5/2 kernel with unit variance.'''
+        r"""Matérn-5/2 kernel with unit variance."""
         d = cdist(X1.reshape(-1, 1), X2.reshape(-1, 1), "euclidean")
         s = np.sqrt(5.0) * d / self.length_scale
         return (1.0 + s + s**2 / 3.0) * np.exp(-s)
@@ -124,19 +127,28 @@ class GPRProfilePerturber:
         n_samples: int = 1,
         rng: Optional[np.random.Generator] = None,
     ) -> np.ndarray:
-        r'''! Draw perturbed profiles whose pointwise 1\f$\sigma\f$
+        r"""Draw perturbed profiles whose pointwise :math:`1\sigma`
         matches the supplied experimental uncertainty exactly.
 
-        @param psi_N          1-D normalised flux grid
-        @param input_profile  1-D baseline profile (GP mean)
-        @param sigma_profile  1-D experimental uncertainty **in profile
-                              units** — this becomes the GP's marginal
-                              standard deviation at every grid point
-        @param n_samples      Number of independent draws
-        @param rng            ``numpy.random.Generator``; ``None``
-                              creates a fresh unseeded generator
-        @result 2-D array of shape ``(n_samples, len(psi_N))``
-        '''
+        Parameters
+        ----------
+        psi_N : ndarray
+            1-D normalised flux grid.
+        input_profile : ndarray
+            1-D baseline profile (GP mean).
+        sigma_profile : ndarray
+            1-D experimental uncertainty **in profile units** -- this
+            becomes the GP's marginal standard deviation at every
+            grid point.
+        n_samples : int
+            Number of independent draws.
+        rng : numpy.random.Generator or None
+            ``None`` creates a fresh unseeded generator.
+
+        Returns
+        -------
+        ndarray, shape ``(n_samples, len(psi_N))``
+        """
         if rng is None:
             rng = np.random.default_rng()
 
@@ -175,26 +187,39 @@ def generate_perturbed_GPR(
     rng: Optional[np.random.Generator] = None,
     diag_plot: bool = False,
 ) -> np.ndarray:
-    r'''! One-call wrapper: perturb a 1-D profile with a GPR draw.
+    r"""One-call wrapper: perturb a 1-D profile with a GPR draw.
 
-    The ``sigma_profile`` input is the experimental 1\f$\sigma\f$
-    uncertainty **in the same units as the profile**.  It maps
-    directly to the GP marginal standard deviation — no separate
-    ``variance`` parameter is needed.
+    The ``sigma_profile`` input is the experimental
+    :math:`1\sigma` uncertainty **in the same units as the profile**.
+    It maps directly to the GP marginal standard deviation -- no
+    separate ``variance`` parameter is needed.
 
-    @param xdata          1-D normalised flux grid \f$ \hat{\psi} \f$
-    @param profile        1-D baseline profile (GP mean)
-    @param sigma_profile  1-D experimental 1\f$\sigma\f$ uncertainty
-                          **in profile units**.  ``None`` → zero
-                          (no perturbation).
-    @param length_scale   GPR correlation length (controls wiggliness)
-    @param n_samples      Number of independent draws
-    @param kernel_func    ``'rbf'`` or ``'matern52'``
-    @param rng            Optional ``numpy.random.Generator``
-    @param diag_plot      Show a three-panel diagnostic figure
-    @result If ``n_samples == 1``: 1-D array of length ``len(xdata)``.
-            Otherwise: 2-D array ``(n_samples, len(xdata))``.
-    '''
+    Parameters
+    ----------
+    xdata : ndarray
+        1-D normalised flux grid :math:`\hat{\psi}`.
+    profile : ndarray
+        1-D baseline profile (GP mean).
+    sigma_profile : ndarray or None
+        1-D experimental :math:`1\sigma` uncertainty **in profile
+        units**.  ``None`` gives zero (no perturbation).
+    length_scale : float
+        GPR correlation length (controls wiggliness).
+    n_samples : int
+        Number of independent draws.
+    kernel_func : str
+        ``'rbf'`` or ``'matern52'``.
+    rng : numpy.random.Generator or None
+        Optional random generator.
+    diag_plot : bool
+        Show a three-panel diagnostic figure.
+
+    Returns
+    -------
+    ndarray
+        If ``n_samples == 1``: 1-D array of length ``len(xdata)``.
+        Otherwise: 2-D array ``(n_samples, len(xdata))``.
+    """
     if sigma_profile is None:
         sigma_profile = np.zeros_like(xdata)
 
@@ -279,22 +304,35 @@ def verify_gpr_statistics(
     n_verification=5000,
     confidence_band=2.0,
 ):
-    r'''! Verify GPR sampling statistics against theoretical predictions.
+    r"""Verify GPR sampling statistics against theoretical predictions.
 
     Draws a large number of samples and checks:
-    1. Pointwise mean ≈ input profile  (bias check)
-    2. Pointwise std  ≈ uncertainty_prof  (variance check)
-    3. Fraction of samples outside ±kσ  ≈ theoretical  (tail check)
 
-    @param psi_N             Normalised flux grid
-    @param profile           Baseline profile (GP mean)
-    @param uncertainty_prof  Experimental 1σ uncertainty envelope u(x)
-                             (same units as profile)
-    @param length_scale      GPR length-scale
-    @param n_verification    Number of Monte-Carlo draws
-    @param confidence_band   Number of σ for the band (e.g. 2.0)
-    @result dict with verification diagnostics
-    '''
+    1. Pointwise mean :math:`\approx` input profile  (bias check)
+    2. Pointwise std  :math:`\approx` ``uncertainty_prof``  (variance check)
+    3. Fraction of samples outside :math:`\pm k\sigma` :math:`\approx` theoretical  (tail check)
+
+    Parameters
+    ----------
+    psi_N : ndarray
+        Normalised flux grid.
+    profile : ndarray
+        Baseline profile (GP mean).
+    uncertainty_prof : ndarray
+        Experimental :math:`1\sigma` uncertainty envelope (same units
+        as profile).
+    length_scale : float
+        GPR length-scale.
+    n_verification : int
+        Number of Monte-Carlo draws.
+    confidence_band : float
+        Number of :math:`\sigma` for the band (e.g. 2.0).
+
+    Returns
+    -------
+    dict
+        Verification diagnostics.
+    """
     perturber = GPRProfilePerturber(
         kernel_func="rbf",
         length_scale=length_scale,
@@ -410,12 +448,14 @@ def verify_gpr_statistics(
 # ====================================================================
 #  Internal inductance proxy
 # ====================================================================
-def calc_cylindrical_li_proxy(j_phi_profile, psi_pad):
+def calc_cylindrical_li_proxy(mygs, j_phi_profile, psi_pad):
     """
     Calculates a proxy for internal inductance l_i(3) using 1D profiles.
 
     Parameters
     ----------
+    mygs : TokaMaker
+        TokaMaker Grad-Shafranov solver object (used for geometry queries).
     j_phi_profile : array-like
         The toroidal current density profile (perturbation target).
     psi_pad : float
@@ -472,74 +512,6 @@ def calc_cylindrical_li_proxy(j_phi_profile, psi_pad):
 
     return li_proxy
 
-
-# ====================================================================
-#  Uncertainty envelope builder.
-#  Multiply against your profile of choice to give σ(ψ_N).
-# ====================================================================
-def new_uncertainty_profiles(
-    psi_N,
-    uncertainty,
-    falloff_exp=None,
-    edge_val=0.0,
-    falloff_loc=0.8,
-    tail_alpha=2.5,
-):
-    r'''! Build a 1-D uncertainty envelope over normalised flux.
-
-    Two modes are supported:
-
-    * **Power-law mode** (`falloff_exp` is not ``None``):
-      \f$ u(\hat{\psi}) = U\,(1 - \hat{\psi})^{\mathrm{falloff\_exp}} \f$
-
-    * **Flat + tail mode** (default, `falloff_exp` is ``None``):
-      constant value \f$ U \f$ for \f$ \hat{\psi} \le \hat{\psi}_{\rm loc} \f$,
-      then a cosine (or cosh) decay to `edge_val` at \f$ \hat{\psi}=1 \f$
-      controlled by `tail_alpha`.
-
-    @param psi_N        1-D array of normalised poloidal flux \f$ \hat{\psi} \f$
-    @param uncertainty   Scalar amplitude \f$ U \f$ of the envelope
-    @param falloff_exp   Exponent for the power-law branch (``None`` ⟹ flat + tail)
-    @param edge_val      Envelope value at \f$ \hat{\psi}=1 \f$ (flat + tail mode)
-    @param falloff_loc   \f$ \hat{\psi}_{\rm loc} \f$ where the tail begins
-    @param tail_alpha    Sharpness exponent \f$ \alpha \f$ of the cosine/cosh tail
-    @result 1-D ``ndarray`` of the same length as `psi_N`
-    '''
-    # ---- power-law branch -------------------------------------------
-    if falloff_exp is not None:
-        return uncertainty * (1.0 - psi_N) ** falloff_exp
-
-    # ---- flat + cosine/cosh tail branch -----------------------------
-    profile_left = uncertainty * np.ones_like(psi_N)
-    stitch_height = uncertainty                        # value at falloff_loc
-
-    dist_to_edge = max(1.0 - falloff_loc, 1e-5)       # avoid division by zero
-
-    if edge_val < stitch_height:
-        # --- cosine decay ---
-        target_cos = np.clip(
-            (edge_val / stitch_height) ** (1.0 / tail_alpha), -1.0, 1.0
-        )
-        omega = np.arccos(target_cos) / dist_to_edge
-
-        base_cos = np.maximum(np.cos(omega * (psi_N - falloff_loc)), 0.0)
-        profile_right = stitch_height * (base_cos ** tail_alpha)
-    else:
-        # --- cosh rise (rare) ---
-        target_cosh = (edge_val / stitch_height) ** (1.0 / tail_alpha)
-        omega = np.arccosh(target_cosh) / dist_to_edge
-        profile_right = stitch_height * (
-            np.cosh(omega * (psi_N - falloff_loc)) ** tail_alpha
-        )
-
-    profile = np.where(psi_N <= falloff_loc, profile_left, profile_right)
-
-    if edge_val >= 0.0:
-        profile = np.maximum(profile, 0.0)
-
-    return profile
-
-
 # ====================================================================
 #  Helper: draw a monotonically-decreasing GPR perturbation
 # ====================================================================
@@ -550,20 +522,33 @@ def _draw_monotonic_perturbation(
     length_scale,
     max_draws=_MAX_MONOTONIC_DRAWS,
 ):
-    r'''! Repeatedly sample a GPR perturbation until the draw is
+    r"""Repeatedly sample a GPR perturbation until the draw is
     monotonically decreasing.
 
-    @param psi_N              Normalised flux grid
-    @param normalised_profile Profile divided by its on-axis value
-    @param sigma_profile      1\f$\sigma\f$ uncertainty in normalised-
-                              profile units (same grid)
-    @param length_scale       GPR correlation length
-    @param max_draws          Safety cap on the number of attempts
-    @result 1-D ``ndarray`` – the accepted (still normalised) perturbation
+    Parameters
+    ----------
+    psi_N : ndarray
+        Normalised flux grid.
+    normalised_profile : ndarray
+        Profile divided by its on-axis value.
+    sigma_profile : ndarray
+        :math:`1\sigma` uncertainty in normalised-profile units
+        (same grid).
+    length_scale : float
+        GPR correlation length.
+    max_draws : int
+        Safety cap on the number of attempts.
 
-    @warning Raises ``RuntimeError`` if no monotonic draw is found
-             within `max_draws` attempts.
-    '''
+    Returns
+    -------
+    ndarray
+        The accepted (still normalised) perturbation.
+
+    Raises
+    ------
+    RuntimeError
+        If no monotonic draw is found within *max_draws* attempts.
+    """
     for _ in range(max_draws):
         sample = generate_perturbed_GPR(
             psi_N,
@@ -616,48 +601,83 @@ def perturb_kinetic_equilibrium(
     max_pressure_iter=_MAX_PRESSURE_ITER,
     max_li_iter=_MAX_LI_ITER,
 ):
-    r'''! Perturb kinetic and current-density profiles and iterate to
-    match \f$ I_p \f$ and \f$ l_i \f$ targets.
+    r"""Perturb kinetic and current-density profiles and iterate to
+    match :math:`I_p` and :math:`l_i` targets.
 
-    @param mygs               TokaMaker Grad-Shafranov solver object
-    @param psi_N              1-D normalised poloidal flux grid \f$ \hat{\psi} \f$
-    @param pressure           1-D baseline total pressure [Pa]
-    @param ne                 1-D electron density [m\f$^{-3}\f$]
-    @param te                 1-D electron temperature [eV]
-    @param ni                 1-D ion density [m\f$^{-3}\f$]
-    @param ti                 1-D ion temperature [eV]
-    @param input_j_phi        1-D toroidal current density [A/m\f$^2\f$];
-                              must be the *inductive* component when
-                              ``recalculate_j_BS=True``
-    @param sigma_ne           1-D experimental 1\f$\sigma\f$ for \f$ n_e \f$ [m\f$^{-3}\f$]
-    @param sigma_te           1-D experimental 1\f$\sigma\f$ for \f$ T_e \f$ [eV]
-    @param sigma_ni           1-D experimental 1\f$\sigma\f$ for \f$ n_i \f$ [m\f$^{-3}\f$]
-    @param sigma_ti           1-D experimental 1\f$\sigma\f$ for \f$ T_i \f$ [eV]
-    @param sigma_jphi         1-D experimental 1\f$\sigma\f$ for \f$ j_\phi \f$ [A/m\f$^2\f$]
-    @param n_ls               GPR length-scale for density profiles
-    @param t_ls               GPR length-scale for temperature profiles
-    @param j_ls               GPR length-scale for \f$ j_\phi \f$
-    @param Ip_target          Target plasma current [A]
-    @param l_i_target         Target internal inductance
-    @param Zeff               Effective ion charge (scalar)
-    @param npsi               1-D normalised poloidal flux grid size
-    @param p_thresh           Acceptable \f$ \langle P \rangle \f$ mismatch [%]
-    @param input_jinductive   Dimensionless inductive \f$ j_\phi \f$ shape
-                              (required when ``recalculate_j_BS=True``)
-    @param l_i_tolerance      Absolute \f$ l_i \f$ matching tolerance
-    @param l_i_proxy_threshold Proxy \f$ l_i \f$ relative error threshold [%]
-    @param psi_pad            Padding inside the LCFS for profile queries
-    @param constrain_sawteeth Reject equilibria with \f$ q_0 < 1 \f$
-    @param recalculate_j_BS   Recompute bootstrap current for perturbed profiles
-    @param diagnostic_plots   Show diagnostic matplotlib figures
-    @param max_pressure_iter  Safety cap on pressure-matching loop
-    @param max_li_iter        Safety cap on \f$ l_i \f$-matching loop
-    @result Tuple ``(ne_perturb, te_perturb, ni_perturb, ti_perturb,
-            w_ExB, output_jphi, diagnostics)``
-    '''
+    Parameters
+    ----------
+    mygs : TokaMaker
+        TokaMaker Grad-Shafranov solver object.
+    psi_N : ndarray
+        1-D normalised poloidal flux grid :math:`\hat{\psi}`.
+    pressure : ndarray
+        1-D baseline total pressure [Pa].
+    ne : ndarray
+        1-D electron density [m\ :sup:`-3`].
+    te : ndarray
+        1-D electron temperature [eV].
+    ni : ndarray
+        1-D ion density [m\ :sup:`-3`].
+    ti : ndarray
+        1-D ion temperature [eV].
+    input_j_phi : ndarray
+        1-D toroidal current density [A/m\ :sup:`2`]; must be the
+        *inductive* component when ``recalculate_j_BS=True``.
+    sigma_ne : ndarray
+        1-D experimental :math:`1\sigma` for :math:`n_e` [m\ :sup:`-3`].
+    sigma_te : ndarray
+        1-D experimental :math:`1\sigma` for :math:`T_e` [eV].
+    sigma_ni : ndarray
+        1-D experimental :math:`1\sigma` for :math:`n_i` [m\ :sup:`-3`].
+    sigma_ti : ndarray
+        1-D experimental :math:`1\sigma` for :math:`T_i` [eV].
+    sigma_jphi : ndarray
+        1-D experimental :math:`1\sigma` for :math:`j_\phi` [A/m\ :sup:`2`].
+    n_ls : float
+        GPR length-scale for density profiles.
+    t_ls : float
+        GPR length-scale for temperature profiles.
+    j_ls : float
+        GPR length-scale for :math:`j_\phi`.
+    Ip_target : float
+        Target plasma current [A].
+    l_i_target : float
+        Target internal inductance.
+    Zeff : float
+        Effective ion charge (scalar).
+    npsi : int
+        Normalised poloidal flux grid size.
+    p_thresh : float
+        Acceptable :math:`\langle P \rangle` mismatch [%].
+    input_jinductive : ndarray or None
+        Dimensionless inductive :math:`j_\phi` shape (required when
+        ``recalculate_j_BS=True``).
+    l_i_tolerance : float
+        Absolute :math:`l_i` matching tolerance.
+    l_i_proxy_threshold : float
+        Proxy :math:`l_i` relative error threshold [%].
+    psi_pad : float
+        Padding inside the LCFS for profile queries.
+    constrain_sawteeth : bool
+        Reject equilibria with :math:`q_0 < 1`.
+    recalculate_j_BS : bool
+        Recompute bootstrap current for perturbed profiles.
+    diagnostic_plots : bool
+        Show diagnostic matplotlib figures.
+    max_pressure_iter : int
+        Safety cap on pressure-matching loop.
+    max_li_iter : int
+        Safety cap on :math:`l_i`-matching loop.
+
+    Returns
+    -------
+    tuple
+        ``(ne_perturb, te_perturb, ni_perturb, ti_perturb,
+        w_ExB, output_jphi, diagnostics)``
+    """
 
     # ----------------------------------------------------------------
-    #  0.  Lazy OFT imports (deferred so GPR-only use works without OFT)
+    #  1.  Lazy OFT imports (deferred so GPR-only use works without OFT)
     # ----------------------------------------------------------------
     from scipy.optimize import root_scalar
     from OpenFUSIONToolkit.TokaMaker.util import get_jphi_from_GS
@@ -668,7 +688,7 @@ def perturb_kinetic_equilibrium(
     )
 
     # ----------------------------------------------------------------
-    #  1.  Validate inputs
+    #  2.  Validate inputs
     # ----------------------------------------------------------------
     if recalculate_j_BS and input_jinductive is None:
         raise ValueError(
@@ -676,7 +696,7 @@ def perturb_kinetic_equilibrium(
         )
 
     # ----------------------------------------------------------------
-    #  2.  Perturb kinetic profiles to match <P>
+    #  3.  Perturb kinetic profiles to match <P>
     # ----------------------------------------------------------------
     inp_avg = mygs.flux_integral(psi_N, pressure)
 
@@ -718,7 +738,7 @@ def perturb_kinetic_equilibrium(
     mygs.set_targets(Ip=Ip_target, pax=pres_tmp[0])
 
     # ----------------------------------------------------------------
-    #  1b.  Optional diagnostic plots for kinetic profiles
+    #  3b. Optional diagnostic plots for kinetic profiles
     # ----------------------------------------------------------------
     if diagnostic_plots:
         fig, ax = plt.subplots(2, 2, figsize=(9, 5), sharex=True)
@@ -749,7 +769,7 @@ def perturb_kinetic_equilibrium(
         plt.show()
 
     # ----------------------------------------------------------------
-    #  3.  Bootstrap-current recalculation (optional)
+    #  4.  Bootstrap-current recalculation (optional)
     # ----------------------------------------------------------------
     j0_scales = []
     Ip_scales = []
@@ -769,7 +789,7 @@ def perturb_kinetic_equilibrium(
 
         new_jphi = results["total_j_phi"]
         spike_profile = results["isolated_j_BS"]
-        baseline_li_proxy = calc_cylindrical_li_proxy(new_jphi, psi_pad)
+        baseline_li_proxy = calc_cylindrical_li_proxy(mygs, new_jphi, psi_pad)
 
         j0_scales.append(results["scale_j0"])
         Ip_scales.append(results["scale_Ip"])
@@ -778,10 +798,10 @@ def perturb_kinetic_equilibrium(
     else:
         # When bootstrap is not recalculated there is no edge spike
         spike_profile = np.zeros_like(psi_N)
-        baseline_li_proxy = calc_cylindrical_li_proxy(input_j_phi, psi_pad)
+        baseline_li_proxy = calc_cylindrical_li_proxy(mygs, input_j_phi, psi_pad)
 
     # ----------------------------------------------------------------
-    #  4.  l_i matching loop
+    #  5.  l_i matching loop
     # ----------------------------------------------------------------
     l_i = np.inf
     final_scale_j0 = 1.0
@@ -794,7 +814,7 @@ def perturb_kinetic_equilibrium(
         if abs(l_i - l_i_target) <= l_i_tolerance:
             break
 
-        # ---- 3a. Draw j_phi perturbation matching l_i proxy --------
+        # ---- 5a. Draw j_phi perturbation matching l_i proxy --------
         step_j_phi = (
             results["j_inductive"] if recalculate_j_BS else input_j_phi
         )
@@ -825,13 +845,13 @@ def perturb_kinetic_equilibrium(
             a_optimal = result_root.root
             matched_jphi_perturb = a_optimal * jphi_perturb + spike_profile
 
-            tmp_li_proxy = calc_cylindrical_li_proxy(matched_jphi_perturb, psi_pad)
+            tmp_li_proxy = calc_cylindrical_li_proxy(mygs, matched_jphi_perturb, psi_pad)
             l_i_rel_err = (
                 100.0 * abs(tmp_li_proxy - baseline_li_proxy) / baseline_li_proxy
             )
         print("Found potential l_i match via proxy!\n")
 
-        # ---- 3b. Set up GS profiles --------------------------------
+        # ---- 5b. Set up GS profiles --------------------------------
         psi_range = mygs.psi_bounds[1] - mygs.psi_bounds[0]
         pprime_tmp = np.gradient(pres_tmp) / (np.gradient(psi_N) * psi_range)
         pprime_tmp[-1] = 0.0
@@ -845,7 +865,7 @@ def perturb_kinetic_equilibrium(
 
         matched_j_inductive = a_optimal * jphi_perturb
 
-        # ---- 3c. Find optimal scale factors -------------------------
+        # ---- 5c. Find optimal scale factors -------------------------
         print(f"\n >>> Finding optimal j_phi scale factor")
         final_scale_j0, final_jphi = find_optimal_scale(
             mygs, psi_N, pres_tmp, ffp_prof, pp_prof,
@@ -863,7 +883,7 @@ def perturb_kinetic_equilibrium(
             diagnostic_plots=diagnostic_plots,
         )
 
-        # ---- 3d. Optional sawtooth constraint -----------------------
+        # ---- 5d. Optional sawtooth constraint -----------------------
         if constrain_sawteeth:
             _, q, _, _, _, _ = mygs.get_q(npsi=npsi, psi_pad=psi_pad)
             if q[0] < 1.0:
@@ -874,7 +894,7 @@ def perturb_kinetic_equilibrium(
         j0_scales.append(final_scale_j0)
         Ip_scales.append(final_scale_Ip)
 
-        # ---- 3e. Final GS solves (2 iterations for convergence) -----
+        # ---- 5e. Final GS solves (2 iterations for convergence) -----
         for _ in range(2):
             pprime_tmp = np.gradient(pres_tmp) / (
                 np.gradient(psi_N) * psi_range
@@ -892,7 +912,7 @@ def perturb_kinetic_equilibrium(
             mygs.set_profiles(pp_prof=pp_prof, ffp_prof=ffp_prof)
             mygs.solve()
 
-        # ---- 3f. Evaluate converged equilibrium ---------------------
+        # ---- 5f. Evaluate converged equilibrium ---------------------
         _, f, fp, p, pp = mygs.get_profiles(npsi=npsi, psi_pad=psi_pad)
         _, q, ravgs, _, _, _ = mygs.get_q(npsi=npsi, psi_pad=psi_pad)
         R_avg = ravgs[0]
@@ -947,9 +967,12 @@ def perturb_kinetic_equilibrium(
         )
 
     # ----------------------------------------------------------------
-    #  5.  Package outputs
+    #  6.  Package outputs
     # ----------------------------------------------------------------
-    w_ExB = np.zeros_like(psi_N)  # placeholder – not yet computed
+    # NOTE: w_ExB (E×B rotation) is not yet computed from the
+    # perturbed equilibrium.  A zero placeholder is stored so the
+    # output tuple and HDF5 schema remain forward-compatible.
+    w_ExB = np.zeros_like(psi_N)
 
     diagnostics = {
         "j0_scales": j0_scales,
@@ -1004,43 +1027,89 @@ def generate_perturbed_equilibria(
     diagnostic_plots=True,
     baseline=None,
 ):
-    r'''! Generate a batch of perturbed equilibria and archive to HDF5.
+    r"""Generate a batch of perturbed equilibria and archive to HDF5.
 
-    @param mygs                TokaMaker GS solver object
-    @param psi_N               1-D normalised flux grid \f$ \hat{\psi} \f$
-    @param n_equils            Number of perturbed equilibria to generate
-    @param header              Base name for the HDF5 database
-    @param input_j_phi         1-D baseline toroidal current density [A/m\f$^2\f$]
-    @param ne                  1-D electron density [m\f$^{-3}\f$]
-    @param te                  1-D electron temperature [eV]
-    @param ni                  1-D ion density [m\f$^{-3}\f$]
-    @param ti                  1-D ion temperature [eV]
-    @param sigma_ne            1-D experimental 1\f$\sigma\f$ for \f$ n_e \f$ [m\f$^{-3}\f$]
-    @param sigma_te            1-D experimental 1\f$\sigma\f$ for \f$ T_e \f$ [eV]
-    @param sigma_ni            1-D experimental 1\f$\sigma\f$ for \f$ n_i \f$ [m\f$^{-3}\f$]
-    @param sigma_ti            1-D experimental 1\f$\sigma\f$ for \f$ T_i \f$ [eV]
-    @param sigma_jphi          1-D experimental 1\f$\sigma\f$ for \f$ j_\phi \f$ [A/m\f$^2\f$]
-    @param n_ls                GPR length-scale for density profiles
-    @param t_ls                GPR length-scale for temperature profiles
-    @param j_ls                GPR length-scale for \f$ j_\phi \f$
-    @param initial_Ip_target   Target plasma current [A]
-    @param l_i_target          Target internal inductance
-    @param Zeff                Effective ion charge
-    @param input_jinductive    Dimensionless inductive \f$ j_\phi \f$ shape
-    @param l_i_tolerance       Absolute \f$ l_i \f$ tolerance
-    @param l_i_proxy_threshold Proxy \f$ l_i \f$ relative-error threshold [%]
-    @param psi_pad             LCFS padding for profile queries
-    @param constrain_sawteeth  Reject equilibria with \f$ q_0 < 1 \f$
-    @param recalculate_j_BS    Recompute bootstrap current each iteration
-    @param diagnostic_plots    Show diagnostic matplotlib figures
-    @param baseline            Optional scan-point index for nested HDF5 storage
-    @result ``list[dict]`` – diagnostics from each equilibrium
-    '''
+    Parameters
+    ----------
+    mygs : TokaMaker
+        TokaMaker GS solver object.
+    psi_N : ndarray
+        1-D normalised flux grid :math:`\hat{\psi}`.
+    n_equils : int
+        Number of perturbed equilibria to generate.
+    header : str
+        Base name for the HDF5 database.
+    input_j_phi : ndarray
+        1-D baseline toroidal current density [A/m\ :sup:`2`].
+    ne : ndarray
+        1-D electron density [m\ :sup:`-3`].
+    te : ndarray
+        1-D electron temperature [eV].
+    ni : ndarray
+        1-D ion density [m\ :sup:`-3`].
+    ti : ndarray
+        1-D ion temperature [eV].
+    sigma_ne : ndarray
+        1-D experimental :math:`1\sigma` for :math:`n_e` [m\ :sup:`-3`].
+    sigma_te : ndarray
+        1-D experimental :math:`1\sigma` for :math:`T_e` [eV].
+    sigma_ni : ndarray
+        1-D experimental :math:`1\sigma` for :math:`n_i` [m\ :sup:`-3`].
+    sigma_ti : ndarray
+        1-D experimental :math:`1\sigma` for :math:`T_i` [eV].
+    sigma_jphi : ndarray
+        1-D experimental :math:`1\sigma` for :math:`j_\phi` [A/m\ :sup:`2`].
+    n_ls : float
+        GPR length-scale for density profiles.
+    t_ls : float
+        GPR length-scale for temperature profiles.
+    j_ls : float
+        GPR length-scale for :math:`j_\phi`.
+    initial_Ip_target : float
+        Target plasma current [A].
+    l_i_target : float
+        Target internal inductance.
+    Zeff : float
+        Effective ion charge.
+    input_jinductive : ndarray or None
+        Dimensionless inductive :math:`j_\phi` shape.
+    l_i_tolerance : float
+        Absolute :math:`l_i` tolerance.
+    l_i_proxy_threshold : float
+        Proxy :math:`l_i` relative-error threshold [%].
+    psi_pad : float
+        LCFS padding for profile queries.
+    constrain_sawteeth : bool
+        Reject equilibria with :math:`q_0 < 1`.
+    recalculate_j_BS : bool
+        Recompute bootstrap current each iteration.
+    diagnostic_plots : bool
+        Show diagnostic matplotlib figures.
+    baseline : str, float, int, or None
+        Optional scan-point label for nested HDF5 storage.
+        ``None`` gives the flat layout.
+
+    Returns
+    -------
+    list[dict]
+        Diagnostics from each equilibrium.
+    """
     all_diagnostics = []
 
     # self-consistent pressure for baseline <P>
     pressure = EC * (ne * te + ni * ti)
     npsi = len(pressure)
+
+    # Store baseline profiles and uncertainties so the .h5 file is
+    # self-contained (the plotting GUI only needs the file path).
+    store_baseline_profiles(
+        header, psi_N,
+        ne, te, ni, ti,
+        pressure, input_j_phi,
+        sigma_ne, sigma_te, sigma_ni, sigma_ti, sigma_jphi,
+        initial_Ip_target, l_i_target,
+        baseline=baseline,
+    )
 
     for count in range(n_equils):
         print(f"Perturber count: {count}")
@@ -1101,6 +1170,9 @@ def generate_perturbed_equilibria(
         eq_stats_iter = mygs.get_stats(li_normalization="iter", lcfs_pad=psi_pad)
         li3 = eq_stats_iter["l_i"]
 
+        pressure_perturb = EC * (ne_perturb * te_perturb
+                                  + ni_perturb * ti_perturb)
+
         store_equilibrium(
             header, count, full_path,
             psi_N,
@@ -1112,6 +1184,7 @@ def generate_perturbed_equilibria(
             w_ExB,
             li1, li3,
             baseline=baseline,
+            pressure=pressure_perturb,
         )
 
         # Clean up on-disk eqdsk after archiving
