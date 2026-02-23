@@ -14,6 +14,11 @@ from .sampling import (
     verify_gpr_statistics,
     perturb_kinetic_equilibrium,
 )
+
+from .uncertainties import (
+    new_uncertainty_profiles
+)
+
 from .plotting import plot_family
 from .utils import (
     initialize_equilibrium_database,
