@@ -12,6 +12,20 @@ import numpy as np
 # ====================================================================
 #  Internal helpers
 # ====================================================================
+
+def Ip_flux_integral_vs_target(alpha, jtor_prof, spike_profile, psi_N, Ip_target):
+    r'''! Compute difference between integrated a*j_tor+j_spike profile and Ip_target
+
+    @param alpha Scaling factor to solve for
+    @param jtor_prof Input j_inductive profile
+    @param spike_profile Isolated j_bootstrap spike (a Gaussian), 0.0 everywhere else
+    @param my_psi_N Local psi_N grid
+    @param my_Ip_target Ip target
+    '''
+    prof = alpha*jtor_prof + spike_profile
+    Ip_computed = mygs.flux_integral(psi_N, prof)
+    return Ip_computed - Ip_target
+
 def _baseline_key(baseline):
     """Convert a baseline label (float, int, or str) to an HDF5-safe string.
 

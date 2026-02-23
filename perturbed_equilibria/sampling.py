@@ -30,6 +30,7 @@ from typing import Optional
 import h5py
 
 from .utils import (
+    Ip_flux_integral_vs_target,
     initialize_equilibrium_database,
     store_equilibrium,
     store_baseline_profiles,
@@ -684,7 +685,6 @@ def perturb_kinetic_equilibrium(
     from OpenFUSIONToolkit.TokaMaker.bootstrap import (
         solve_with_bootstrap,
         find_optimal_scale,
-        Ip_flux_integral_vs_target,
     )
 
     # ----------------------------------------------------------------
