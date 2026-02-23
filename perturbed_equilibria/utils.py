@@ -13,7 +13,7 @@ import numpy as np
 #  Internal helpers
 # ====================================================================
 
-def Ip_flux_integral_vs_target(alpha, jtor_prof, spike_profile, psi_N, Ip_target):
+def Ip_flux_integral_vs_target(alpha, mygs, jtor_prof, spike_profile, psi_N, Ip_target):
     r'''! Compute difference between integrated a*j_tor+j_spike profile and Ip_target
 
     @param alpha Scaling factor to solve for

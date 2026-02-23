@@ -837,7 +837,7 @@ def perturb_kinetic_equilibrium(
 
             result_root = root_scalar(
                 Ip_flux_integral_vs_target,
-                args=(jphi_perturb, spike_profile, psi_N, Ip_target),
+                args=(mygs, jphi_perturb, spike_profile, psi_N, Ip_target),
                 bracket=[1.0e-10 * Ip_target, 1.0e1 * Ip_target],
                 method="brentq",
                 rtol=1e-6,
