@@ -8,6 +8,12 @@ from . import utils
 # Use:  from perturbed_equilibria import gui
 
 # Public API re-exports
+from .sampling import (
+    generate_perturbed_equilibria,
+    generate_perturbed_GPR,
+    verify_gpr_statistics,
+    perturb_kinetic_equilibrium,
+)
 from .plotting import plot_family
 from .utils import (
     initialize_equilibrium_database,
