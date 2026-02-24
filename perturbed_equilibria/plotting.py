@@ -125,7 +125,7 @@ def draw_pressure_profiles(ax, psi_N, pressure, perturbed_data_list=None):
             if "pressure [Pa]" in data:
                 ax.plot(
                     psi_N, data["pressure [Pa]"] * _kPa,
-                    c="tab:green", alpha=0.9, lw=1.5,
+                    c="tab:brown", alpha=0.9, lw=1.5,
                     label=f"perturbed ({n_equils})" if i == 0 else None,
                     zorder=2,
                 )

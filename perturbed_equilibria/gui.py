@@ -30,7 +30,7 @@ if matplotlib.get_backend().lower() in _NON_INTERACTIVE:
         except Exception:
             continue
 import matplotlib.pyplot as plt
-from matplotlib.widgets import RadioButtons, Slider
+from matplotlib.widgets import Button, RadioButtons, Slider
 
 from .utils import (
     discover_scan_values,
@@ -92,6 +92,12 @@ class EquilibriumBrowser:
         radio_ax = self.fig.add_axes([0.01, 0.40, 0.10, 0.20])
         self.radio = RadioButtons(radio_ax, self.TABS, activecolor="tab:blue")
         self.radio.on_clicked(self._on_tab_change)
+
+        # ---- close button (top-right, for WM-less environments) ----------
+        close_ax = self.fig.add_axes([0.92, 0.955, 0.06, 0.035])
+        self._close_btn = Button(close_ax, "Close", color="0.85",
+                                 hovercolor="tab:red")
+        self._close_btn.on_clicked(lambda _: plt.close(self.fig))
 
         # ---- shared plot region ------------------------------------------
         left  = 0.18
