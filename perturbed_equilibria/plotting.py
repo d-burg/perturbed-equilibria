@@ -144,11 +144,11 @@ def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
     axes : array-like of 3 Axes
     psi_N : 1-D array
     j_phi : 1-D array
-        Baseline total :math:`j_\phi` [A/m^2].
+        Baseline total :math:`j_\phi` [A m^-2].
     sigma_jphi : 1-D array
     perturbed_data_list : list[dict] or None
-        Each dict must have ``'j_phi [A/m^2]'``, ``'j_BS [A/m^2]'``,
-        ``'j_inductive [A/m^2]'``.
+        Each dict must have ``'j_phi [A m^-2]'``, ``'j_BS [A m^-2]'``,
+        ``'j_inductive [A m^-2]'``.
     """
     # ---- panel 0: total j_phi with sigma bands ---------------------------
     ax0 = axes[0]
@@ -168,8 +168,8 @@ def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
 
     # ---- panels 1, 2: j_BS and j_inductive (no baseline sigma bands) -----
     _sub = [
-        (axes[1], "j_BS [A/m^2]",        r"$j_{\rm BS}$",        "tab:green"),
-        (axes[2], "j_inductive [A/m^2]",  r"$j_{\rm inductive}$", "tab:orange"),
+        (axes[1], "j_BS [A m^-2]",        r"$j_{\rm BS}$",        "tab:green"),
+        (axes[2], "j_inductive [A m^-2]",  r"$j_{\rm inductive}$", "tab:orange"),
     ]
     for ax, key, label, color in _sub:
         ax.cla()
@@ -181,7 +181,7 @@ def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
         n_equils = len(perturbed_data_list)
         for i, data in enumerate(perturbed_data_list):
             lbl = f"perturbed ({n_equils})" if i == 0 else None
-            ax0.plot(psi_N, data["j_phi [A/m^2]"], c="tab:purple",
+            ax0.plot(psi_N, data["j_phi [A m^-2]"], c="tab:purple",
                      lw=1.5, alpha=0.9, label=lbl, zorder=3)
             for ax, key, label, color in _sub:
                 if key in data:
@@ -268,7 +268,7 @@ def plot_family(h5path_or_header, scan_value=None, mode="kinetic"):
         fig, ax = plt.subplots(3, 1, figsize=(6, 8), sharex=True)
         draw_jphi_profiles(
             ax, psi_N,
-            bl["j_phi [A/m^2]"], bl["sigma_jphi [A/m^2]"],
+            bl["j_phi [A m^-2]"], bl["sigma_jphi [A m^-2]"],
             perturbed_data_list=perturbed,
         )
         fig.tight_layout()

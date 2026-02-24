@@ -25,6 +25,42 @@ from perturbed_equilibria.utils import (
     load_baseline_profiles,
     discover_scan_values,
     count_equilibria,
+    Hmode_profiles,
+)
+
+
+# ====================================================================
+#  Default kinetic profiles (257-point H-mode baselines)
+#  Used as canonical test inputs throughout this module.
+# ====================================================================
+PSI_N = np.linspace(0, 1, 257)
+
+NE = Hmode_profiles(
+    rgrid=257,
+    edge=9.0e+18, ped=3.0e+19, core=5.5e+19,
+    expin=1.0e+00, expout=1.5e+00,
+    widthp=6.0e-02, xphalf=9.75e-01,
+)
+
+NI = Hmode_profiles(
+    rgrid=257,
+    edge=6.0e+18, ped=2.4e+19, core=4.5e+19,
+    expin=1.4e+00, expout=2.3e+00,
+    widthp=6.7e-02, xphalf=9.75e-01,
+)
+
+TE = Hmode_profiles(
+    rgrid=257,
+    edge=7.0e+01, ped=8.3e+02, core=2.5e+03,
+    expin=1.1e+00, expout=9.0e-01,
+    widthp=4.8e-02, xphalf=9.75e-01,
+)
+
+TI = Hmode_profiles(
+    rgrid=257,
+    edge=3.0e+02, ped=1.4e+03, core=5.0e+03,
+    expin=9.5e-01, expout=2.0e+00,
+    widthp=2.0e-01, xphalf=9.5e-01,
 )
 
 

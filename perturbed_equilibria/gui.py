@@ -192,7 +192,7 @@ class EquilibriumBrowser:
         elif tab == self.TABS[2]:  # j_phi
             draw_jphi_profiles(
                 self.jphi_axes, psi_N,
-                bl["j_phi [A/m^2]"], bl["sigma_jphi [A/m^2]"],
+                bl["j_phi [A m^-2]"], bl["sigma_jphi [A m^-2]"],
                 perturbed_data_list=perturbed,
             )
 

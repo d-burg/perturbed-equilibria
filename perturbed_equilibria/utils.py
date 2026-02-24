@@ -26,6 +26,44 @@ def Ip_flux_integral_vs_target(alpha, mygs, jtor_prof, spike_profile, psi_N, Ip_
     Ip_computed = mygs.flux_integral(psi_N, prof)
     return Ip_computed - Ip_target
 
+def Hmode_profiles(edge=0.08, ped=0.4, core=2.5, rgrid=201, expin=1.5, expout=1.5, widthp=0.04, xphalf=None):
+    r'''! This function generates H-mode density and temperature profiles evenly spaced in your favorite 
+    radial coordinate. Copied from https://omfit.io/_modules/omfit_classes/utils_fusion.html
+
+    @param edge Separatrix height (float)
+    @param ped Pedestal height (float)
+    @param core On-axis profile height (float)
+    @param rgrid Number of radial grid points (int)
+    @param expin Inner core exponent for H-mode pedestal profile (float)
+    @param expout Outer core exponent for H-mode pedestal profile (float)
+    @param widthp Width of pedestal (float)
+    @param xphalf Position of tanh (float, optional)
+    @result H-mode profile array over radial grid
+    '''
+
+    w_E1 = 0.5 * widthp  # width as defined in eped
+    if xphalf is None:
+        xphalf = 1.0 - w_E1
+
+    xped = xphalf - w_E1
+
+    pconst = 1.0 - np.tanh((1.0 - xphalf) / w_E1)
+    a_t = 2.0 * (ped - edge) / (1.0 + np.tanh(1.0) - pconst)
+
+    coretanh = 0.5 * a_t * (1.0 - np.tanh(-xphalf / w_E1) - pconst) + edge
+
+    xpsi = np.linspace(0, 1, rgrid)
+    ones = np.ones(rgrid)
+
+    val = 0.5 * a_t * (1.0 - np.tanh((xpsi - xphalf) / w_E1) - pconst) + edge * ones
+
+    xtoped = xpsi / xped
+    for i in range(0, rgrid):
+        if xtoped[i] ** expin < 1.0:
+            val[i] = val[i] + (core - coretanh) * (1.0 - xtoped[i] ** expin) ** expout
+
+    return val
+
 def _baseline_key(baseline):
     """Convert a baseline label (float, int, or str) to an HDF5-safe string.
 
@@ -82,9 +120,9 @@ def initialize_equilibrium_database(header):
 # ====================================================================
 _PROFILE_KEYS = [
     "psi_N",
-    "j_phi [A/m^2]",
-    "j_BS [A/m^2]",
-    "j_inductive [A/m^2]",
+    "j_phi [A m^-2]",
+    "j_BS [A m^-2]",
+    "j_inductive [A m^-2]",
     "n_e [m^-3]",
     "T_e [eV]",
     "n_i [m^-3]",
@@ -162,9 +200,9 @@ def store_equilibrium(
 
         # ---- 1-D profiles -----------------------------------------------
         grp.create_dataset("psi_N",               data=np.asarray(psi_N,       dtype=np.float64))
-        grp.create_dataset("j_phi [A/m^2]",       data=np.asarray(j_phi,       dtype=np.float64))
-        grp.create_dataset("j_BS [A/m^2]",        data=np.asarray(j_BS,        dtype=np.float64))
-        grp.create_dataset("j_inductive [A/m^2]", data=np.asarray(j_inductive, dtype=np.float64))
+        grp.create_dataset("j_phi [A m^-2]",       data=np.asarray(j_phi,       dtype=np.float64))
+        grp.create_dataset("j_BS [A m^-2]",        data=np.asarray(j_BS,        dtype=np.float64))
+        grp.create_dataset("j_inductive [A m^-2]", data=np.asarray(j_inductive, dtype=np.float64))
         grp.create_dataset("n_e [m^-3]",          data=np.asarray(n_e,         dtype=np.float64))
         grp.create_dataset("T_e [eV]",            data=np.asarray(T_e,         dtype=np.float64))
         grp.create_dataset("n_i [m^-3]",          data=np.asarray(n_i,         dtype=np.float64))
@@ -296,12 +334,12 @@ def store_baseline_profiles(
         grp.create_dataset("n_i [m^-3]",         data=np.asarray(ni,         dtype=np.float64))
         grp.create_dataset("T_i [eV]",           data=np.asarray(ti,         dtype=np.float64))
         grp.create_dataset("pressure [Pa]",       data=np.asarray(pressure,   dtype=np.float64))
-        grp.create_dataset("j_phi [A/m^2]",      data=np.asarray(j_phi,      dtype=np.float64))
+        grp.create_dataset("j_phi [A m^-2]",      data=np.asarray(j_phi,      dtype=np.float64))
         grp.create_dataset("sigma_ne [m^-3]",    data=np.asarray(sigma_ne,   dtype=np.float64))
         grp.create_dataset("sigma_te [eV]",      data=np.asarray(sigma_te,   dtype=np.float64))
         grp.create_dataset("sigma_ni [m^-3]",    data=np.asarray(sigma_ni,   dtype=np.float64))
         grp.create_dataset("sigma_ti [eV]",      data=np.asarray(sigma_ti,   dtype=np.float64))
-        grp.create_dataset("sigma_jphi [A/m^2]", data=np.asarray(sigma_jphi, dtype=np.float64))
+        grp.create_dataset("sigma_jphi [A m^-2]", data=np.asarray(sigma_jphi, dtype=np.float64))
 
         grp.attrs["Ip_target"]  = float(Ip_target)
         grp.attrs["l_i_target"] = float(l_i_target)
