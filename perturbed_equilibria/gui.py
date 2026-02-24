@@ -40,7 +40,8 @@ from .utils import (
 from .plotting import (
     draw_kinetic_profiles,
     draw_pressure_profiles,
-    draw_jphi_profiles,
+    draw_jphi_total,
+    draw_jphi_components,
     _load_all_perturbations,
 )
 
@@ -54,7 +55,7 @@ class EquilibriumBrowser:
         Path to the HDF5 equilibrium database.
     """
 
-    TABS = ("Kinetic", "Pressure", r"$j_\phi$")
+    TABS = ("Kinetic", "Pressure", r"$j_\phi$", r"$j_\phi$ comp.")
 
     def __init__(self, h5path):
         self.h5path = os.path.abspath(h5path)
@@ -114,13 +115,15 @@ class EquilibriumBrowser:
         # Pressure: single axes
         self.pressure_ax = self.fig.add_axes([left, bot, w, h])
 
-        # j_phi: 3 vertically stacked
+        # j_phi total: single axes (like pressure)
+        self.jphi_total_ax = self.fig.add_axes([left, bot, w, h])
+
+        # j_phi components: 2 vertically stacked
         jgap = 0.04
-        jh = (h - 2 * jgap) / 3
-        self.jphi_axes = [
-            self.fig.add_axes([left, bot + 2 * (jh + jgap), w, jh]),
-            self.fig.add_axes([left, bot + (jh + jgap),     w, jh]),
-            self.fig.add_axes([left, bot,                   w, jh]),
+        jh = (h - jgap) / 2
+        self.jphi_comp_axes = [
+            self.fig.add_axes([left, bot + jh + jgap, w, jh]),
+            self.fig.add_axes([left, bot,             w, jh]),
         ]
 
         # ---- scan slider (only for hierarchical files) -------------------
@@ -153,8 +156,9 @@ class EquilibriumBrowser:
         for ax in self.kinetic_axes.flat:
             ax.set_visible(tab == self.TABS[0])
         self.pressure_ax.set_visible(tab == self.TABS[1])
-        for ax in self.jphi_axes:
-            ax.set_visible(tab == self.TABS[2])
+        self.jphi_total_ax.set_visible(tab == self.TABS[2])
+        for ax in self.jphi_comp_axes:
+            ax.set_visible(tab == self.TABS[3])
 
     # ------------------------------------------------------------------
     #  Callbacks
@@ -202,10 +206,16 @@ class EquilibriumBrowser:
                 perturbed_data_list=perturbed,
             )
 
-        elif tab == self.TABS[2]:  # j_phi
-            draw_jphi_profiles(
-                self.jphi_axes, psi_N,
+        elif tab == self.TABS[2]:  # j_phi (total)
+            draw_jphi_total(
+                self.jphi_total_ax, psi_N,
                 bl["j_phi [A m^-2]"], bl["sigma_jphi [A m^-2]"],
+                perturbed_data_list=perturbed,
+            )
+
+        elif tab == self.TABS[3]:  # j_phi components
+            draw_jphi_components(
+                self.jphi_comp_axes, psi_N,
                 perturbed_data_list=perturbed,
             )
 

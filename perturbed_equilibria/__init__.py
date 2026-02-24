@@ -24,6 +24,8 @@ from .uncertainties import (
 from .plotting import (
     draw_kinetic_profiles,
     draw_pressure_profiles,
+    draw_jphi_total,
+    draw_jphi_components,
     draw_jphi_profiles,
     plot_family,
     plot_kinetic_profiles,

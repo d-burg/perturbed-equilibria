@@ -133,73 +133,99 @@ def draw_pressure_profiles(ax, psi_N, pressure, perturbed_data_list=None):
     ax.legend(loc="best", fontsize=8)
 
 
-def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
-                       perturbed_data_list=None):
-    r"""Draw :math:`j_\phi` on 3 vertically stacked axes.
-
-    ``axes[0]`` = total :math:`j_\phi`,
-    ``axes[1]`` = :math:`j_{\rm BS}` (with :math:`j_{\rm BS,edge}` dashed),
-    ``axes[2]`` = :math:`j_{\rm inductive}`.
+def draw_jphi_total(ax, psi_N, j_phi, sigma_jphi,
+                    perturbed_data_list=None):
+    r"""Draw total :math:`j_\phi` with uncertainty bands on a single axes.
 
     Parameters
     ----------
-    axes : array-like of 3 Axes
+    ax : Axes
     psi_N : 1-D array
     j_phi : 1-D array
         Baseline total :math:`j_\phi` [A m^-2].
     sigma_jphi : 1-D array
     perturbed_data_list : list[dict] or None
-        Each dict must have ``'j_phi [A m^-2]'``, ``'j_BS [A m^-2]'``,
-        ``'j_inductive [A m^-2]'``.  ``'j_BS,edge [A m^-2]'`` is
-        optional; when present it is overplotted as a dashed line on
-        the :math:`j_{\rm BS}` panel.
+        Each dict must have ``'j_phi [A m^-2]'``.
     """
     _MA = 1e-6  # A → MA
 
-    # ---- panel 0: total j_phi with sigma bands ---------------------------
-    ax0 = axes[0]
-    ax0.cla()
-    ax0.plot(psi_N, j_phi * _MA, c="k", lw=2,
-             label=r"input $j_\phi$", zorder=4)
-    ax0.fill_between(
+    ax.cla()
+    ax.plot(psi_N, j_phi * _MA, c="k", lw=2,
+            label=r"input $j_\phi$", zorder=4)
+    ax.fill_between(
         psi_N,
         (j_phi - sigma_jphi) * _MA,
         (j_phi + sigma_jphi) * _MA,
         alpha=0.25, color="tab:purple",
         label=r"$\pm\,1\sigma_{\rm exp}$", zorder=1,
     )
-    ax0.plot(psi_N, (j_phi + 2 * sigma_jphi) * _MA, c="k", ls=":", lw=1.5,
-             alpha=0.5, label=r"$\pm\,2\sigma_{\rm exp}$", zorder=2)
-    ax0.plot(psi_N, (j_phi - 2 * sigma_jphi) * _MA, c="k", ls=":", lw=1.5,
-             alpha=0.5, zorder=2)
-    ax0.set_ylabel(r"$j_\phi$ [MA/m$^2$]")
-    ax0.grid(ls=":")
+    ax.plot(psi_N, (j_phi + 2 * sigma_jphi) * _MA, c="k", ls=":", lw=1.5,
+            alpha=0.5, label=r"$\pm\,2\sigma_{\rm exp}$", zorder=2)
+    ax.plot(psi_N, (j_phi - 2 * sigma_jphi) * _MA, c="k", ls=":", lw=1.5,
+            alpha=0.5, zorder=2)
+    ax.set_ylabel(r"$j_\phi$ [MA/m$^2$]")
+    ax.set_xlabel(r"$\hat{\psi}$")
+    ax.grid(ls=":")
 
-    # ---- panels 1, 2: j_BS and j_inductive (no baseline sigma bands) -----
+    if perturbed_data_list:
+        n_equils = len(perturbed_data_list)
+        for i, data in enumerate(perturbed_data_list):
+            ax.plot(psi_N, data["j_phi [A m^-2]"] * _MA, c="tab:purple",
+                    lw=1.5, alpha=0.9,
+                    label=f"perturbed ({n_equils})" if i == 0 else None,
+                    zorder=3)
+
+    ax.legend(loc="best", fontsize=8)
+
+
+def draw_jphi_components(axes, psi_N, perturbed_data_list=None):
+    r"""Draw :math:`j_\phi` component decomposition on a (2, 1) axes array.
+
+    ``axes[0]`` = :math:`j_{\rm BS}` (solid) with :math:`j_{\rm BS,edge}`
+    (dashed), ``axes[1]`` = :math:`j_{\rm inductive}`.  Total
+    :math:`j_\phi` is shown as a black dashed reference on both panels.
+
+    Parameters
+    ----------
+    axes : array-like of 2 Axes
+    psi_N : 1-D array
+    perturbed_data_list : list[dict] or None
+        Each dict must have ``'j_phi [A m^-2]'``, ``'j_BS [A m^-2]'``,
+        ``'j_inductive [A m^-2]'``.  ``'j_BS,edge [A m^-2]'`` is
+        optional.
+    """
+    _MA = 1e-6  # A → MA
+
     _sub = [
-        (axes[1], "j_BS [A m^-2]",        r"$j_{\rm BS}$",        "tab:green"),
-        (axes[2], "j_inductive [A m^-2]",  r"$j_{\rm inductive}$", "tab:orange"),
+        (axes[0], "j_BS [A m^-2]",        r"$j_{\rm BS}$",        "tab:green"),
+        (axes[1], "j_inductive [A m^-2]",  r"$j_{\rm inductive}$", "tab:orange"),
     ]
     for ax, key, label, color in _sub:
         ax.cla()
         ax.set_ylabel(f"{label} " + r"[MA/m$^2$]")
         ax.grid(ls=":")
 
-    # ---- overlay perturbed draws on all three panels ---------------------
     if perturbed_data_list:
         n_equils = len(perturbed_data_list)
         for i, data in enumerate(perturbed_data_list):
             lbl = f"perturbed ({n_equils})" if i == 0 else None
-            ax0.plot(psi_N, data["j_phi [A m^-2]"] * _MA, c="tab:purple",
-                     lw=1.5, alpha=0.9, label=lbl, zorder=3)
+
+            # reference: total j_phi on both panels
+            for ax, *_ in _sub:
+                ax.plot(psi_N, data["j_phi [A m^-2]"] * _MA,
+                        c="k", ls="--", lw=1.2, alpha=0.5,
+                        label=r"$j_\phi$ (total)" if i == 0 else None,
+                        zorder=2)
+
+            # component curves
             for ax, key, label, color in _sub:
                 if key in data:
                     ax.plot(psi_N, data[key] * _MA, c=color, lw=1.5,
                             alpha=0.9, label=lbl, zorder=3)
 
-            # overlay j_BS,edge as dashed on the j_BS panel
+            # j_BS,edge overlay on the j_BS panel
             if "j_BS,edge [A m^-2]" in data:
-                axes[1].plot(
+                axes[0].plot(
                     psi_N, data["j_BS,edge [A m^-2]"] * _MA,
                     c="tab:red", ls="--", lw=1.5, alpha=0.8,
                     label=r"$j_{\rm BS,edge}$" if i == 0 else None,
@@ -209,6 +235,25 @@ def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
     for ax in axes:
         ax.legend(loc="best", fontsize=8)
     axes[-1].set_xlabel(r"$\hat{\psi}$")
+
+
+def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
+                       perturbed_data_list=None):
+    r"""**Deprecated** -- use :func:`draw_jphi_total` and
+    :func:`draw_jphi_components` instead.
+
+    Draws on 3 vertically stacked axes for backward compatibility.
+    """
+    warnings.warn(
+        "draw_jphi_profiles() is deprecated.  Use draw_jphi_total() and "
+        "draw_jphi_components() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    draw_jphi_total(axes[0], psi_N, j_phi, sigma_jphi,
+                    perturbed_data_list=perturbed_data_list)
+    draw_jphi_components(axes[1:], psi_N,
+                         perturbed_data_list=perturbed_data_list)
 
 
 # ====================================================================
@@ -283,19 +328,30 @@ def plot_family(h5path_or_header, scan_value=None, mode="kinetic"):
         axes_list.append(ax)
 
     if mode in ("j-phi", "all"):
-        fig, ax = plt.subplots(3, 1, figsize=(6, 8), sharex=True)
-        draw_jphi_profiles(
-            ax, psi_N,
+        fig_jt, ax_jt = plt.subplots(figsize=(6, 4))
+        draw_jphi_total(
+            ax_jt, psi_N,
             bl["j_phi [A m^-2]"], bl["sigma_jphi [A m^-2]"],
             perturbed_data_list=perturbed,
         )
-        fig.tight_layout()
-        figs.append(fig)
-        axes_list.append(ax)
+        fig_jt.tight_layout()
+        figs.append(fig_jt)
+        axes_list.append(ax_jt)
+
+        fig_jc, ax_jc = plt.subplots(2, 1, figsize=(6, 6), sharex=True)
+        draw_jphi_components(
+            ax_jc, psi_N,
+            perturbed_data_list=perturbed,
+        )
+        fig_jc.tight_layout()
+        figs.append(fig_jc)
+        axes_list.append(ax_jc)
 
     if mode == "all":
         return figs, axes_list
-    return figs[0], axes_list[0]
+    if len(figs) == 1:
+        return figs[0], axes_list[0]
+    return figs, axes_list
 
 
 # ====================================================================
