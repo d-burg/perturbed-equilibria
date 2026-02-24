@@ -598,6 +598,8 @@ def perturb_kinetic_equilibrium(
     psi_pad=1e-3,
     constrain_sawteeth=True,
     recalculate_j_BS=True,
+    isolate_edge_jBS=True,
+    scale_jBS=1.0,
     diagnostic_plots=False,
     max_pressure_iter=_MAX_PRESSURE_ITER,
     max_li_iter=_MAX_LI_ITER,
@@ -663,8 +665,15 @@ def perturb_kinetic_equilibrium(
         Reject equilibria with :math:`q_0 < 1`.
     recalculate_j_BS : bool
         Recompute bootstrap current for perturbed profiles.
+    isolate_edge_jBS : bool
+        Separate the edge bootstrap-current spike from the core
+        contribution inside ``solve_with_bootstrap``.
+    scale_jBS : float
+        Multiplicative scale factor applied to :math:`j_{\rm BS}` in
+        ``solve_with_bootstrap``.  A value of 1.0 applies no scaling.
     diagnostic_plots : bool
-        Show diagnostic matplotlib figures.
+        Show diagnostic matplotlib figures (including inside
+        ``solve_with_bootstrap`` and ``find_optimal_scale``).
     max_pressure_iter : int
         Safety cap on pressure-matching loop.
     max_li_iter : int
@@ -781,13 +790,14 @@ def perturb_kinetic_equilibrium(
             mygs,
             ne_perturb, te_perturb, ni_perturb, ti_perturb,
             Zeff, Ip_target, input_jinductive,
-            scale_jBS=1.0,
-            isolate_edge_jBS=True,
-            diagnostic_plots=False,
+            scale_jBS=scale_jBS,
+            isolate_edge_jBS=isolate_edge_jBS,
+            diagnostic_plots=diagnostic_plots,
         )
         eq_stats = mygs.get_stats(lcfs_pad=psi_pad)
 
         new_jphi = results["total_j_phi"]
+        full_j_BS = results["j_BS"]
         spike_profile = results["isolated_j_BS"]
         baseline_li_proxy = calc_cylindrical_li_proxy(mygs, new_jphi, psi_pad)
 
@@ -797,6 +807,7 @@ def perturb_kinetic_equilibrium(
         iteration_Ips.append(eq_stats["Ip"])
     else:
         # When bootstrap is not recalculated there is no edge spike
+        full_j_BS = np.zeros_like(psi_N)
         spike_profile = np.zeros_like(psi_N)
         baseline_li_proxy = calc_cylindrical_li_proxy(mygs, input_j_phi, psi_pad)
 
@@ -980,7 +991,8 @@ def perturb_kinetic_equilibrium(
         "iteration_l_is": iteration_l_is,
         "iteration_Ips": iteration_Ips,
         "j_inductive": matched_j_inductive * final_scale_j0,
-        "j_BS": spike_profile,
+        "j_BS": full_j_BS,
+        "j_BS_edge": spike_profile,
     }
 
     return (
@@ -1024,6 +1036,8 @@ def generate_perturbed_equilibria(
     psi_pad=1e-3,
     constrain_sawteeth=True,
     recalculate_j_BS=True,
+    isolate_edge_jBS=True,
+    jBS_scale_range=None,
     diagnostic_plots=True,
     baseline=None,
 ):
@@ -1083,6 +1097,17 @@ def generate_perturbed_equilibria(
         Reject equilibria with :math:`q_0 < 1`.
     recalculate_j_BS : bool
         Recompute bootstrap current each iteration.
+    isolate_edge_jBS : bool
+        Separate the edge bootstrap-current spike from the core
+        contribution inside ``solve_with_bootstrap``.
+    jBS_scale_range : list of two floats, or None
+        :math:`\pm 1\sigma` bounds for a normally distributed
+        multiplicative scale factor applied to :math:`j_{\rm BS}`.
+        For example, ``[0.9, 1.1]`` draws from
+        :math:`\mathcal{N}(\mu{=}1.0,\, \sigma{=}0.1)` each
+        iteration, centred on 1.0 with a half-width of 0.1.
+        When ``None``, no additional scaling is applied
+        (``scale_jBS = 1.0`` for every sample).
     diagnostic_plots : bool
         Show diagnostic matplotlib figures.
     baseline : str, float, int, or None
@@ -1100,6 +1125,15 @@ def generate_perturbed_equilibria(
     pressure = EC * (ne * te + ni * ti)
     npsi = len(pressure)
 
+    # Pre-compute jBS scale factors for the whole batch (if requested).
+    if jBS_scale_range is not None:
+        lo, hi = jBS_scale_range
+        jBS_mu = 0.5 * (lo + hi)
+        jBS_sigma = 0.5 * (hi - lo)
+        jBS_scales = np.random.normal(jBS_mu, jBS_sigma, size=n_equils)
+    else:
+        jBS_scales = np.ones(n_equils)
+
     # Store baseline profiles and uncertainties so the .h5 file is
     # self-contained (the plotting GUI only needs the file path).
     store_baseline_profiles(
@@ -1112,7 +1146,8 @@ def generate_perturbed_equilibria(
     )
 
     for count in range(n_equils):
-        print(f"Perturber count: {count}")
+        scale_jBS = float(jBS_scales[count])
+        print(f"Perturber count: {count}  (scale_jBS={scale_jBS:.4f})")
         t_start = time.perf_counter()
 
         (
@@ -1145,6 +1180,8 @@ def generate_perturbed_equilibria(
             psi_pad=psi_pad,
             constrain_sawteeth=constrain_sawteeth,
             recalculate_j_BS=recalculate_j_BS,
+            isolate_edge_jBS=isolate_edge_jBS,
+            scale_jBS=scale_jBS,
             diagnostic_plots=diagnostic_plots,
         )
 
@@ -1185,6 +1222,7 @@ def generate_perturbed_equilibria(
             li1, li3,
             baseline=baseline,
             pressure=pressure_perturb,
+            j_BS_edge=diagnostics["j_BS_edge"],
         )
 
         # Clean up on-disk eqdsk after archiving

@@ -111,18 +111,20 @@ def draw_pressure_profiles(ax, psi_N, pressure, perturbed_data_list=None):
     perturbed_data_list : list[dict] or None
         Each dict must have ``'pressure [Pa]'``.
     """
+    _kPa = 1e-3
     ax.cla()
-    ax.plot(psi_N, pressure, c="k", lw=2, label="input pressure", zorder=3)
+    ax.plot(psi_N, pressure * _kPa, c="k", lw=2,
+            label="input pressure", zorder=3)
     ax.grid(ls=":")
     ax.set_xlabel(r"$\hat{\psi}$")
-    ax.set_ylabel("Pressure [Pa]")
+    ax.set_ylabel("Pressure [kPa]")
 
     if perturbed_data_list:
         n_equils = len(perturbed_data_list)
         for i, data in enumerate(perturbed_data_list):
             if "pressure [Pa]" in data:
                 ax.plot(
-                    psi_N, data["pressure [Pa]"],
+                    psi_N, data["pressure [Pa]"] * _kPa,
                     c="tab:green", alpha=0.9, lw=1.5,
                     label=f"perturbed ({n_equils})" if i == 0 else None,
                     zorder=2,
@@ -136,7 +138,7 @@ def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
     r"""Draw :math:`j_\phi` on 3 vertically stacked axes.
 
     ``axes[0]`` = total :math:`j_\phi`,
-    ``axes[1]`` = :math:`j_{\rm BS}`,
+    ``axes[1]`` = :math:`j_{\rm BS}` (with :math:`j_{\rm BS,edge}` dashed),
     ``axes[2]`` = :math:`j_{\rm inductive}`.
 
     Parameters
@@ -148,22 +150,29 @@ def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
     sigma_jphi : 1-D array
     perturbed_data_list : list[dict] or None
         Each dict must have ``'j_phi [A m^-2]'``, ``'j_BS [A m^-2]'``,
-        ``'j_inductive [A m^-2]'``.
+        ``'j_inductive [A m^-2]'``.  ``'j_BS,edge [A m^-2]'`` is
+        optional; when present it is overplotted as a dashed line on
+        the :math:`j_{\rm BS}` panel.
     """
+    _MA = 1e-6  # A → MA
+
     # ---- panel 0: total j_phi with sigma bands ---------------------------
     ax0 = axes[0]
     ax0.cla()
-    ax0.plot(psi_N, j_phi, c="k", lw=2, label=r"input $j_\phi$", zorder=4)
+    ax0.plot(psi_N, j_phi * _MA, c="k", lw=2,
+             label=r"input $j_\phi$", zorder=4)
     ax0.fill_between(
-        psi_N, j_phi - sigma_jphi, j_phi + sigma_jphi,
+        psi_N,
+        (j_phi - sigma_jphi) * _MA,
+        (j_phi + sigma_jphi) * _MA,
         alpha=0.25, color="tab:purple",
         label=r"$\pm\,1\sigma_{\rm exp}$", zorder=1,
     )
-    ax0.plot(psi_N, j_phi + 2 * sigma_jphi, c="k", ls=":", lw=1.5,
+    ax0.plot(psi_N, (j_phi + 2 * sigma_jphi) * _MA, c="k", ls=":", lw=1.5,
              alpha=0.5, label=r"$\pm\,2\sigma_{\rm exp}$", zorder=2)
-    ax0.plot(psi_N, j_phi - 2 * sigma_jphi, c="k", ls=":", lw=1.5,
+    ax0.plot(psi_N, (j_phi - 2 * sigma_jphi) * _MA, c="k", ls=":", lw=1.5,
              alpha=0.5, zorder=2)
-    ax0.set_ylabel(r"$j_\phi$ [A/m$^2$]")
+    ax0.set_ylabel(r"$j_\phi$ [MA/m$^2$]")
     ax0.grid(ls=":")
 
     # ---- panels 1, 2: j_BS and j_inductive (no baseline sigma bands) -----
@@ -173,7 +182,7 @@ def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
     ]
     for ax, key, label, color in _sub:
         ax.cla()
-        ax.set_ylabel(f"{label} " + r"[A/m$^2$]")
+        ax.set_ylabel(f"{label} " + r"[MA/m$^2$]")
         ax.grid(ls=":")
 
     # ---- overlay perturbed draws on all three panels ---------------------
@@ -181,12 +190,21 @@ def draw_jphi_profiles(axes, psi_N, j_phi, sigma_jphi,
         n_equils = len(perturbed_data_list)
         for i, data in enumerate(perturbed_data_list):
             lbl = f"perturbed ({n_equils})" if i == 0 else None
-            ax0.plot(psi_N, data["j_phi [A m^-2]"], c="tab:purple",
+            ax0.plot(psi_N, data["j_phi [A m^-2]"] * _MA, c="tab:purple",
                      lw=1.5, alpha=0.9, label=lbl, zorder=3)
             for ax, key, label, color in _sub:
                 if key in data:
-                    ax.plot(psi_N, data[key], c=color, lw=1.5,
+                    ax.plot(psi_N, data[key] * _MA, c=color, lw=1.5,
                             alpha=0.9, label=lbl, zorder=3)
+
+            # overlay j_BS,edge as dashed on the j_BS panel
+            if "j_BS,edge [A m^-2]" in data:
+                axes[1].plot(
+                    psi_N, data["j_BS,edge [A m^-2]"] * _MA,
+                    c="tab:red", ls="--", lw=1.5, alpha=0.8,
+                    label=r"$j_{\rm BS,edge}$" if i == 0 else None,
+                    zorder=4,
+                )
 
     for ax in axes:
         ax.legend(loc="best", fontsize=8)

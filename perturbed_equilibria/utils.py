@@ -122,6 +122,7 @@ _PROFILE_KEYS = [
     "psi_N",
     "j_phi [A m^-2]",
     "j_BS [A m^-2]",
+    "j_BS,edge [A m^-2]",
     "j_inductive [A m^-2]",
     "n_e [m^-3]",
     "T_e [eV]",
@@ -148,6 +149,7 @@ def store_equilibrium(
     li3,
     baseline=None,
     pressure=None,
+    j_BS_edge=None,
 ):
     """
     Write one perturbed equilibrium into the HDF5 database.
@@ -174,6 +176,8 @@ def store_equilibrium(
     pressure : array_like or None
         1-D total pressure [Pa].  Optional for backward compatibility
         with older workflows.
+    j_BS_edge : array_like or None
+        1-D isolated edge bootstrap current [A m^-2].
     """
     db_path = os.path.abspath(f"{header}.h5")
     if not os.path.isfile(db_path):
@@ -203,6 +207,9 @@ def store_equilibrium(
         grp.create_dataset("j_phi [A m^-2]",       data=np.asarray(j_phi,       dtype=np.float64))
         grp.create_dataset("j_BS [A m^-2]",        data=np.asarray(j_BS,        dtype=np.float64))
         grp.create_dataset("j_inductive [A m^-2]", data=np.asarray(j_inductive, dtype=np.float64))
+
+        if j_BS_edge is not None:
+            grp.create_dataset("j_BS,edge [A m^-2]", data=np.asarray(j_BS_edge, dtype=np.float64))
         grp.create_dataset("n_e [m^-3]",          data=np.asarray(n_e,         dtype=np.float64))
         grp.create_dataset("T_e [eV]",            data=np.asarray(T_e,         dtype=np.float64))
         grp.create_dataset("n_i [m^-3]",          data=np.asarray(n_i,         dtype=np.float64))
