@@ -16,6 +16,19 @@ import os
 import sys
 
 import numpy as np
+import matplotlib
+# Switch to an interactive backend before pyplot is first imported.
+# This only takes effect when gui.py itself is the entry point (CLI).
+# In a Jupyter/IPython session the kernel would already have imported
+# pyplot before this module is loaded, so the use() call is a no-op there.
+_NON_INTERACTIVE = {"agg", "pdf", "ps", "svg", "pgf", "cairo"}
+if matplotlib.get_backend().lower() in _NON_INTERACTIVE:
+    for _backend in ("TkAgg", "Qt5Agg", "QtAgg", "GTK3Agg", "macosx"):
+        try:
+            matplotlib.use(_backend)
+            break
+        except Exception:
+            continue
 import matplotlib.pyplot as plt
 from matplotlib.widgets import RadioButtons, Slider
 
@@ -201,7 +214,7 @@ class EquilibriumBrowser:
     # ------------------------------------------------------------------
     def show(self):
         """Enter the matplotlib event loop."""
-        plt.show()
+        plt.show(block=True)
 
 
 # ======================================================================
