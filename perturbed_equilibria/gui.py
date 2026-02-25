@@ -22,13 +22,52 @@ import matplotlib
 # In a Jupyter/IPython session the kernel would already have imported
 # pyplot before this module is loaded, so the use() call is a no-op there.
 _NON_INTERACTIVE = {"agg", "pdf", "ps", "svg", "pgf", "cairo"}
-if matplotlib.get_backend().lower() in _NON_INTERACTIVE:
-    for _backend in ("TkAgg", "Qt5Agg", "QtAgg", "GTK3Agg", "macosx"):
-        try:
-            matplotlib.use(_backend)
-            break
-        except Exception:
-            continue
+
+
+def _ensure_interactive_backend():
+    """Guarantee that an interactive backend is active.
+
+    Two failure modes are handled:
+
+    1. The backend is already known to be non-interactive (e.g. plain ``Agg``
+       selected by default on a headless machine).
+    2. An ostensibly interactive backend was requested via the
+       ``MPLBACKEND`` environment variable (e.g. ``TkAgg``) but it fails
+       to initialise at runtime (missing ``$DISPLAY``, no Tk libraries,
+       …) and matplotlib silently falls back to ``Agg`` — which only
+       becomes visible *after* ``pyplot`` has been imported.
+
+    ``force=True`` is used so the switch works correctly even when
+    ``pyplot`` has already been imported (e.g. the module is reloaded
+    inside a long-lived IPython / Jupyter session).
+    """
+    candidates = ("TkAgg", "Qt5Agg", "QtAgg", "GTK3Agg", "macosx")
+
+    def _try_switch():
+        for name in candidates:
+            try:
+                matplotlib.use(name, force=True)
+                if matplotlib.get_backend().lower() not in _NON_INTERACTIVE:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # First check: is the currently configured backend non-interactive?
+    if matplotlib.get_backend().lower() in _NON_INTERACTIVE:
+        _try_switch()
+        return
+
+    # Import pyplot so we can detect the silent-fallback case.
+    import matplotlib.pyplot as _plt_probe  # noqa: F401
+
+    # Second check: did pyplot's init silently fall back to a non-interactive
+    # backend (common when e.g. TkAgg is requested but Tk is unavailable)?
+    if matplotlib.get_backend().lower() in _NON_INTERACTIVE:
+        _try_switch()
+
+
+_ensure_interactive_backend()
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, RadioButtons, Slider
 
