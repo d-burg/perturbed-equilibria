@@ -9,6 +9,7 @@ Dependencies: numpy, scipy, contourpy (ships with matplotlib).
 
 import io
 import tempfile
+import warnings
 
 import contourpy
 import numpy as np
@@ -829,6 +830,12 @@ class GEQDSKEquilibrium:
                 ):
                     # Quadratic extrapolation from last three non-zero points
                     prof[-1] = 3.0 * prof[-2] - 3.0 * prof[-3] + prof[-4]
+                    # Clip to zero if the extrapolation overshoots past
+                    # zero (sign reversal relative to the neighbour).
+                    # Use np.sign rather than a product test to avoid
+                    # float underflow when both values are tiny.
+                    if np.sign(prof[-1]) != np.sign(prof[-2]):
+                        prof[-1] = 0.0
         pprime_interp = interpolate.InterpolatedUnivariateSpline(psi_N_raw, pprime_raw)
         ffprim_interp = interpolate.InterpolatedUnivariateSpline(psi_N_raw, ffprim_raw)
 
@@ -1071,6 +1078,19 @@ class GEQDSKEquilibrium:
             * (avg["PPRIME"] * avg["R"] + avg["FFPRIM"] * avg["1/R"] / constants.mu_0)
             * (2.0 * np.pi) ** cc["exp_Bp"]
         ) + 0.0
+
+        # Warn if the non-extrapolated portion of the Jt profile changes
+        # sign.  Exclude the last surface (potentially extrapolated) when
+        # extrapolate_edge is active so only genuinely computed values are
+        # checked.
+        jt_check = avg["Jt_GS"][:-1] if self._extrapolate_edge else avg["Jt_GS"]
+        jt_nz = jt_check[jt_check != 0]
+        if len(jt_nz) > 1 and np.any(jt_nz > 0) and np.any(jt_nz < 0):
+            warnings.warn(
+                "The direct Grad-Shafranov Jt profile changes sign across "
+                "flux surfaces; this may indicate unusual equilibrium data.",
+                stacklevel=2,
+            )
 
         # Geometry: volume and cross-section area
         psi_arr = psi_N_levels * dpsi + self.psi_axis
