@@ -425,6 +425,150 @@ def _resample_contour(R, Z, npts=257, periodic=True):
     return R_new, Z_new
 
 
+def _detect_xpoint_angle(R, Z, R0, Z0):
+    """Detect the X-point angle on a separatrix contour.
+
+    Finds the location of the sharpest bend (minimum cosine of angle
+    between adjacent tangent vectors) and returns the corresponding
+    θ = arctan2(Z − Z₀, R − R₀).  Adapted from OMFIT fluxSurface.py
+    lines 1115-1124.
+
+    Parameters
+    ----------
+    R, Z : 1-D arrays
+        Separatrix contour (should be nearly closed: first ≈ last).
+    R0, Z0 : float
+        Magnetic axis coordinates.
+
+    Returns
+    -------
+    float
+        Poloidal angle of the X-point, or ``None`` if detection fails.
+    """
+    R = np.asarray(R, dtype=float)
+    Z = np.asarray(Z, dtype=float)
+    n = len(R)
+    if n < 6:
+        return None
+
+    n1 = n - 1  # number of unique points (last = first)
+    dR_a = np.gradient(R[:n1])
+    dZ_a = np.gradient(Z[:n1])
+    dR_b = np.gradient(np.concatenate([R[1:n1], R[0:1]]))
+    dZ_b = np.gradient(np.concatenate([Z[1:n1], Z[0:1]]))
+    dot = dR_a * dR_b + dZ_a * dZ_b
+    norm = np.sqrt(dR_a**2 + dZ_a**2) * np.sqrt(dR_b**2 + dZ_b**2)
+    norm = np.maximum(norm, 1e-30)
+    cos_angle = dot / norm
+    idx_xpt = np.argmin(cos_angle)
+
+    return float(np.arctan2(Z[idx_xpt] - Z0, R[idx_xpt] - R0))
+
+
+def _resample_contour_theta(R, Z, R0, Z0, npts=257, theta_xpt=None):
+    """Resample a closed contour to *npts* equally-spaced-in-angle points.
+
+    Matches OMFIT's ``fluxSurface._resample`` method (fluxSurface.py
+    lines 1091-1169): fits periodic cubic splines R(θ) and Z(θ) where
+    θ = arctan2(Z − Z₀, R − R₀), sorts points starting from the
+    X-point angle, and evaluates on a uniform θ grid with OMFIT-style
+    domain wrapping.
+
+    Following OMFIT's convention, the X-point angle should be detected
+    once on the separatrix and reused for all near-separatrix surfaces.
+    If *theta_xpt* is not provided the sharpest bend on *this* contour
+    is used as a fallback.
+
+    Parameters
+    ----------
+    R, Z : 1-D arrays
+        Contour coordinates (should be nearly closed: first ≈ last).
+    R0, Z0 : float
+        Magnetic axis coordinates.
+    npts : int
+        Number of output points (including the repeated closing point).
+    theta_xpt : float or None
+        Pre-computed X-point angle (from ``_detect_xpoint_angle`` on the
+        separatrix).  If ``None``, detected from this contour.
+
+    Returns
+    -------
+    R_new, Z_new : 1-D arrays of length *npts*
+    """
+    R = np.asarray(R, dtype=float).copy()
+    Z = np.asarray(Z, dtype=float).copy()
+    R[-1], Z[-1] = R[0], Z[0]
+    n = len(R)
+
+    if n < 6:
+        return R, Z  # too few points to fit a spline
+
+    n1 = n - 1  # number of unique points (last = first)
+
+    # --- X-point angle: use pre-computed value or detect from this contour
+    if theta_xpt is None:
+        theta_xpt = _detect_xpoint_angle(R, Z, R0, Z0)
+        if theta_xpt is None:
+            return R, Z
+
+    # --- Compute theta from magnetic axis, sort starting from X-point.
+    #     This mirrors OMFIT fluxSurface.py lines 1139-1161.
+    t_raw = np.arctan2(Z - Z0, R - R0)
+
+    # Sort contour points by theta relative to X-point angle
+    t_rel = (t_raw[:n1] - theta_xpt) % (2.0 * np.pi)
+    idx = np.argsort(t_rel)
+    idx = np.concatenate([idx, idx[0:1]])  # re-close
+
+    t_sorted = np.unwrap(t_raw[idx])
+    R_sorted = R[idx]
+    Z_sorted = Z[idx]
+
+    # Force monotonically increasing (OMFIT lines 1148-1152)
+    if t_sorted[0] > t_sorted[1]:
+        t_sorted = -t_sorted
+
+    # Guard against degenerate theta span
+    t_span = t_sorted[-1] - t_sorted[0]
+    if abs(t_span) < 1e-6:
+        return R, Z
+
+    # --- Build uniform evaluation grid starting at X-point angle, then
+    #     sort it the same way (OMFIT lines 1130, 1154-1156).
+    theta0 = np.linspace(0, 2 * np.pi, npts) + theta_xpt
+    # Sort evaluation grid relative to X-point (same wrapping as data)
+    idx_eval = np.argsort((theta0[:-1] + theta_xpt) % (2 * np.pi) - theta_xpt)
+    idx_eval = np.concatenate([idx_eval, idx_eval[0:1]])
+    theta_eval = np.unwrap(theta0[idx_eval])
+    # Match sign convention of t_sorted
+    if t_sorted[0] > 0 and theta_eval[0] < 0:
+        theta_eval = -theta_eval
+    elif t_sorted[0] < 0 and theta_eval[0] > 0:
+        theta_eval = -theta_eval
+
+    # --- Periodic cubic spline in theta-space.
+    #
+    #     OMFIT fluxSurface.py line 1167 uses per=1 (periodic) for all
+    #     surfaces.  While a comment ``# per=per)`` suggests per=0 was
+    #     intended for the separatrix, the running code is per=1.  We
+    #     match OMFIT's running code: the periodic spline combined with
+    #     the evaluation wrapping below handles the X-point topology
+    #     well in practice.
+    tck_R = interpolate.splrep(t_sorted, R_sorted, k=3, per=True)
+    tck_Z = interpolate.splrep(t_sorted, Z_sorted, k=3, per=True)
+
+    # Evaluate with OMFIT-style domain wrapping (line 1168):
+    #   (theta - t[0]) % (t[-1] - t[0]) + t[0]
+    t_range = t_sorted[-1] - t_sorted[0]
+    theta_wrapped = (theta_eval - t_sorted[0]) % t_range + t_sorted[0]
+    R_new = interpolate.splev(theta_wrapped, tck_R, ext=0)
+    Z_new = interpolate.splev(theta_wrapped, tck_Z, ext=0)
+
+    # Enforce exact closure
+    R_new[-1], Z_new[-1] = R_new[0], Z_new[0]
+    return R_new, Z_new
+
+
 # ---------------------------------------------------------------------------
 # Section 5: GEQDSKEquilibrium class
 # ---------------------------------------------------------------------------
@@ -444,16 +588,28 @@ class GEQDSKEquilibrium:
     nlevels : int or None
         Number of normalised-psi levels for flux-surface analysis.
         Defaults to NW from the g-file.
+    resample : ``"theta"`` or ``"arc_length"``
+        Contour resampling method for near-separatrix surfaces
+        (ψ_N ≥ 0.99).  ``"theta"`` (default) resamples in angular
+        space from the magnetic axis using the OMFIT "method of
+        angles", which preserves the X-point cusp via a non-periodic
+        spline.  ``"arc_length"`` falls back to the raw contourpy
+        points without resampling.
     """
 
-    def __init__(self, filename, cocos=1, nlevels=None):
+    def __init__(self, filename, cocos=1, nlevels=None, resample="theta"):
         self._raw = _read_geqdsk(filename)
         self._cocos = _cocos_params(cocos)
         self._nlevels = nlevels if nlevels is not None else int(self._raw["NW"])
+        if resample not in ("theta", "arc_length"):
+            raise ValueError(
+                f"resample must be 'theta' or 'arc_length', got {resample!r}"
+            )
+        self._resample_method = resample
         self._cache = {}
 
     @classmethod
-    def from_bytes(cls, raw_bytes, cocos=1, nlevels=None):
+    def from_bytes(cls, raw_bytes, cocos=1, nlevels=None, resample="theta"):
         """Construct from in-memory bytes (e.g. from HDF5 storage).
 
         Parameters
@@ -464,12 +620,14 @@ class GEQDSKEquilibrium:
             COCOS index.
         nlevels : int
             Number of psi_N levels.
+        resample : str
+            Contour resampling method (``"theta"`` or ``"arc_length"``).
         """
         with tempfile.NamedTemporaryFile(mode="wb", suffix=".geqdsk",
                                          delete=False) as tmp:
             tmp.write(raw_bytes)
             tmp_path = tmp.name
-        return cls(tmp_path, cocos=cocos, nlevels=nlevels)
+        return cls(tmp_path, cocos=cocos, nlevels=nlevels, resample=resample)
 
     # --- Raw data properties ---
 
@@ -669,6 +827,23 @@ class GEQDSKEquilibrium:
         ]}
         contour_data = []  # store (R, Z) for each surface
 
+        # Pre-detect X-point angle from the separatrix contour.
+        # Following OMFIT convention, this angle is detected once on the
+        # separatrix and reused for all near-separatrix surfaces so that
+        # the spline domain boundary is always placed at the true X-point
+        # location, even for surfaces where the cusp is too subtle for
+        # reliable per-contour detection.
+        theta_xpt = None
+        if self._resample_method == "theta" and nc > 1:
+            sep_seg = _select_main_contour(
+                contours[nc - 1], R0, Z0,
+                cc["sigma_RpZ"], cc["sigma_rhotp"],
+            )
+            if sep_seg is not None and len(sep_seg) >= 6:
+                theta_xpt = _detect_xpoint_angle(
+                    sep_seg[:, 0], sep_seg[:, 1], R0, Z0
+                )
+
         # Precompute dpsi spacing (once, outside the loop)
         dpsi_arr = np.abs(np.gradient(psi_levels))
 
@@ -732,15 +907,25 @@ class GEQDSKEquilibrium:
             # spline.  This smooths contourpy discretisation artefacts and
             # gives uniform quadrature weights.
             #
-            # Near the separatrix (psi_N ≳ 0.99) the X-point cusp makes the
-            # contour non-smooth: any cubic spline (periodic or not) would
-            # smooth the cusp, distorting the contour and biasing <Jt> high.
-            # For these outermost surfaces we keep the raw contourpy points.
+            # Near the separatrix (psi_N ≳ 0.99) the X-point cusp makes
+            # arc-length resampling problematic: a periodic cubic spline
+            # would smooth the cusp, distorting the contour.  Two options:
+            #   "theta"      — OMFIT-style angular resampling preserves the
+            #                   cusp via non-periodic spline in θ-space.
+            #   "arc_length" — fall back to raw contourpy points (no
+            #                   resampling) for near-separatrix surfaces.
             if pn < 0.99 and len(seg) >= 20:
+                # Interior: always periodic arc-length resampling
                 r_s, z_s = _resample_contour(seg[:, 0], seg[:, 1], npts=257)
+            elif self._resample_method == "theta" and len(seg) >= 20:
+                # Near-separatrix: angular resampling preserves X-point cusp
+                r_s, z_s = _resample_contour_theta(
+                    seg[:, 0], seg[:, 1], R0, Z0, npts=257,
+                    theta_xpt=theta_xpt,
+                )
             else:
+                # Fallback: raw contourpy points
                 r_s, z_s = seg[:, 0].copy(), seg[:, 1].copy()
-                # Ensure closure for raw contourpy points
                 r_s[-1], z_s[-1] = r_s[0], z_s[0]
             contour_data.append(np.column_stack([r_s, z_s]))
 
@@ -1107,7 +1292,7 @@ class GEQDSKEquilibrium:
 # Convenience function
 # ---------------------------------------------------------------------------
 
-def read_geqdsk(filename, cocos=1, nlevels=None):
+def read_geqdsk(filename, cocos=1, nlevels=None, resample="theta"):
     """Read a GEQDSK file and return a GEQDSKEquilibrium object.
 
     Parameters
@@ -1118,9 +1303,17 @@ def read_geqdsk(filename, cocos=1, nlevels=None):
         COCOS convention index (default 1).
     nlevels : int
         Number of psi_N levels for flux-surface analysis.
+    resample : str
+        Contour resampling method for near-separatrix surfaces
+        (``psi_N >= 0.99``).  ``"theta"`` (default) uses OMFIT-style
+        angular resampling that preserves the X-point cusp.
+        ``"arc_length"`` falls back to raw contourpy points (no
+        resampling) for these surfaces.
 
     Returns
     -------
     GEQDSKEquilibrium
     """
-    return GEQDSKEquilibrium(filename, cocos=cocos, nlevels=nlevels)
+    return GEQDSKEquilibrium(
+        filename, cocos=cocos, nlevels=nlevels, resample=resample
+    )

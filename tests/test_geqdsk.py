@@ -358,3 +358,269 @@ class TestConvenience:
         eq = GEQDSKEquilibrium.from_bytes(raw)
         assert abs(eq.R_mag - params["R0"]) < 1e-6
         assert abs(eq.Ip - params["Ip"]) < 1e-2
+
+
+# ---------------------------------------------------------------------------
+# Tests: Validation against OMFIT and TokaMaker on a real D3D-like equilibrium
+# ---------------------------------------------------------------------------
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+D3DLIKE_GFILE = os.path.join(DATA_DIR, "d3dlike.geqdsk")
+D3DLIKE_REF = os.path.join(DATA_DIR, "d3dlike_reference.npz")
+
+_has_d3dlike_data = (
+    os.path.isfile(D3DLIKE_GFILE) and os.path.isfile(D3DLIKE_REF)
+)
+
+
+@pytest.fixture(scope="module")
+def d3dlike_eq():
+    """Load the D3D-like equilibrium once per module."""
+    return GEQDSKEquilibrium(D3DLIKE_GFILE, nlevels=257)
+
+
+@pytest.fixture(scope="module")
+def d3dlike_ref():
+    """Load the reference arrays once per module."""
+    return dict(np.load(D3DLIKE_REF))
+
+
+@pytest.mark.skipif(not _has_d3dlike_data, reason="D3D-like test data not found")
+class TestD3DLikeValidation:
+    """Compare our flux-surface-averaged Jt against OMFIT and TokaMaker
+    reference arrays for a real D3D-like TokaMaker equilibrium.
+
+    Reference data:
+      - jt_omfit_numerical: OMFIT's numerical <Jt> (negative sign convention)
+      - jt_tokamaker_direct: TokaMaker's direct GS Jt (positive sign convention)
+
+    Our equivalents:
+      - eq.j_tor_averaged_numerical  ↔  jt_omfit_numerical   (same sign)
+      - eq.j_tor_averaged_direct     ↔  jt_tokamaker_direct  (opposite sign)
+    """
+
+    def test_grid_size(self, d3dlike_eq):
+        """The D3D-like g-file should be 257×257."""
+        assert len(d3dlike_eq.R_grid) == 257
+        assert len(d3dlike_eq.Z_grid) == 257
+
+    def test_psi_N_length(self, d3dlike_eq, d3dlike_ref):
+        """Our psi_N grid should match the reference array length."""
+        assert len(d3dlike_eq.psi_N) == len(d3dlike_ref["jt_omfit_numerical"])
+
+    def test_numerical_jt_vs_omfit(self, d3dlike_eq, d3dlike_ref):
+        """j_tor_averaged_numerical should match OMFIT's numerical <Jt>.
+
+        Both use the same sign convention (negative for this equilibrium).
+        Agreement is < 0.2% throughout the core and pedestal.  The last
+        point (separatrix, psi_N = 1) can differ by ~6% because the two
+        codes handle the X-point contour differently, so we exclude it.
+        """
+        ours = d3dlike_eq.j_tor_averaged_numerical
+        omfit = d3dlike_ref["jt_omfit_numerical"]
+        n = len(ours)
+
+        # Exclude the last point (separatrix) — X-point contour handling
+        # differs between our raw-point approach and OMFIT's spline.
+        for k in range(1, n - 1):
+            if abs(omfit[k]) < 1e3:
+                assert abs(ours[k] - omfit[k]) < 1e3, (
+                    f"k={k}: ours={ours[k]:.2f}, omfit={omfit[k]:.2f}"
+                )
+            else:
+                rel = abs(ours[k] - omfit[k]) / abs(omfit[k])
+                assert rel < 0.01, (
+                    f"k={k}: ours={ours[k]:.2f}, omfit={omfit[k]:.2f}, "
+                    f"rel={rel:.4f}"
+                )
+
+    def test_direct_jt_vs_tokamaker(self, d3dlike_eq, d3dlike_ref):
+        """j_tor_averaged_direct should match TokaMaker's direct GS Jt.
+
+        TokaMaker uses positive sign; our convention is negative for this
+        equilibrium, so we compare absolute values.
+
+        Agreement is < 0.2% in the core (psi_N < 0.9).  In the H-mode
+        pedestal (psi_N ~ 0.92-0.95) the steep pressure gradient amplifies
+        small contour differences, giving ~1-2% mismatch.  Beyond
+        psi_N ~ 0.95 the separatrix X-point causes larger divergence,
+        so we exclude the outermost ~5%.
+        """
+        ours = d3dlike_eq.j_tor_averaged_direct
+        tkmkr = d3dlike_ref["jt_tokamaker_direct"]
+        n = len(ours)
+
+        # Exclude outermost ~5% where X-point effects dominate.
+        k_edge = int(0.95 * (n - 1))  # psi_N ~ 0.95
+        # Two tiers: strict in core, relaxed in pedestal.
+        k_pedestal = int(0.90 * (n - 1))  # psi_N ~ 0.90
+
+        for k in range(1, k_edge + 1):
+            ours_abs = abs(ours[k])
+            tkmkr_abs = abs(tkmkr[k])
+            tol = 0.005 if k <= k_pedestal else 0.02
+            if tkmkr_abs < 1e3:
+                assert abs(ours_abs - tkmkr_abs) < 1e3, (
+                    f"k={k}: |ours|={ours_abs:.2f}, |tkmkr|={tkmkr_abs:.2f}"
+                )
+            else:
+                rel = abs(ours_abs - tkmkr_abs) / tkmkr_abs
+                assert rel < tol, (
+                    f"k={k}: |ours|={ours_abs:.2f}, |tkmkr|={tkmkr_abs:.2f}, "
+                    f"rel={rel:.4f} (tol={tol})"
+                )
+
+    def test_axis_agreement(self, d3dlike_eq, d3dlike_ref):
+        """On-axis values should agree to < 0.1%."""
+        ours_num = d3dlike_eq.j_tor_averaged_numerical[0]
+        omfit_num = d3dlike_ref["jt_omfit_numerical"][0]
+        rel = abs(ours_num - omfit_num) / abs(omfit_num)
+        assert rel < 0.001, f"Axis numerical: rel={rel:.6f}"
+
+        ours_dir = abs(d3dlike_eq.j_tor_averaged_direct[0])
+        tkmkr_dir = abs(d3dlike_ref["jt_tokamaker_direct"][0])
+        rel = abs(ours_dir - tkmkr_dir) / tkmkr_dir
+        assert rel < 0.001, f"Axis direct: rel={rel:.6f}"
+
+    def test_sign_conventions(self, d3dlike_eq, d3dlike_ref):
+        """OMFIT numerical and our numerical should share the same sign.
+        TokaMaker direct has opposite sign from our direct.
+        """
+        # OMFIT and ours: same sign (negative)
+        assert np.sign(d3dlike_eq.j_tor_averaged_numerical[0]) == np.sign(
+            d3dlike_ref["jt_omfit_numerical"][0]
+        )
+        # TokaMaker is positive, ours is negative → opposite signs
+        assert np.sign(d3dlike_eq.j_tor_averaged_direct[0]) == -np.sign(
+            d3dlike_ref["jt_tokamaker_direct"][0]
+        )
+
+    def test_standard_jt_reasonable(self, d3dlike_eq):
+        """The default j_tor_averaged (<Jt/R>/<1/R>) should be finite
+        and nonzero for this equilibrium.
+        """
+        jt = d3dlike_eq.j_tor_averaged
+        assert np.all(np.isfinite(jt))
+        assert np.any(np.abs(jt) > 0)
+
+    def test_edge_derivative_sign(self, d3dlike_eq):
+        """The last few points of j_tor should have a consistent derivative
+        sign (no artificial spike from resampling artefacts).
+        """
+        jt = d3dlike_eq.j_tor_averaged_numerical
+        # Check that the last 5 points don't have a sign flip in
+        # the derivative that would indicate a resampling artefact.
+        # (The derivative should be monotonically decreasing in
+        # magnitude toward the edge for this equilibrium.)
+        diffs = np.diff(jt[-6:])
+        # All diffs should have the same sign
+        signs = np.sign(diffs)
+        # Allow at most one sign change (noise) out of 5 diffs
+        sign_changes = np.sum(np.abs(np.diff(signs)) > 0)
+        assert sign_changes <= 1, (
+            f"Too many sign changes in edge Jt derivative: {sign_changes}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Theta resampling (OMFIT angular method)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def d3dlike_eq_theta():
+    """Load D3D-like equilibrium with theta resampling (explicit)."""
+    return GEQDSKEquilibrium(D3DLIKE_GFILE, nlevels=257, resample="theta")
+
+
+@pytest.fixture(scope="module")
+def d3dlike_eq_arclen():
+    """Load D3D-like equilibrium with arc-length (raw points) fallback."""
+    return GEQDSKEquilibrium(D3DLIKE_GFILE, nlevels=257, resample="arc_length")
+
+
+@pytest.mark.skipif(not _has_d3dlike_data, reason="D3D-like test data not found")
+class TestThetaResample:
+    """Tests for the OMFIT-style angular resampling option."""
+
+    def test_theta_resample_basic(self, gfile_path):
+        """GEQDSKEquilibrium with resample='theta' should run without error
+        on the Solov'ev equilibrium and produce reasonable j_tor_averaged.
+        """
+        path, _ = gfile_path
+        eq = GEQDSKEquilibrium(path, resample="theta")
+        jt = eq.j_tor_averaged
+        assert np.all(np.isfinite(jt))
+        assert np.any(np.abs(jt) > 0)
+
+    def test_invalid_resample_option(self, gfile_path):
+        """Invalid resample option should raise ValueError."""
+        path, _ = gfile_path
+        with pytest.raises(ValueError, match="resample"):
+            GEQDSKEquilibrium(path, resample="invalid")
+
+    def test_theta_resample_numerical_jt_vs_omfit(
+        self, d3dlike_eq_theta, d3dlike_ref
+    ):
+        """Theta resampling should match OMFIT's numerical <Jt>.
+
+        With angular resampling, even the last few points near the
+        separatrix should be better resolved.  We compare up to
+        the second-to-last point.
+        """
+        ours = d3dlike_eq_theta.j_tor_averaged_numerical
+        omfit = d3dlike_ref["jt_omfit_numerical"]
+        n = len(ours)
+
+        for k in range(1, n - 1):
+            if abs(omfit[k]) < 1e3:
+                assert abs(ours[k] - omfit[k]) < 1e3, (
+                    f"k={k}: ours={ours[k]:.2f}, omfit={omfit[k]:.2f}"
+                )
+            else:
+                rel = abs(ours[k] - omfit[k]) / abs(omfit[k])
+                assert rel < 0.01, (
+                    f"k={k}: ours={ours[k]:.2f}, omfit={omfit[k]:.2f}, "
+                    f"rel={rel:.4f}"
+                )
+
+    def test_theta_resample_direct_jt_vs_tokamaker(
+        self, d3dlike_eq_theta, d3dlike_ref
+    ):
+        """Theta resampling: direct Jt vs TokaMaker with same tolerances."""
+        ours = d3dlike_eq_theta.j_tor_averaged_direct
+        tkmkr = d3dlike_ref["jt_tokamaker_direct"]
+        n = len(ours)
+
+        k_edge = int(0.95 * (n - 1))
+        k_pedestal = int(0.90 * (n - 1))
+
+        for k in range(1, k_edge + 1):
+            ours_abs = abs(ours[k])
+            tkmkr_abs = abs(tkmkr[k])
+            tol = 0.005 if k <= k_pedestal else 0.02
+            if tkmkr_abs < 1e3:
+                assert abs(ours_abs - tkmkr_abs) < 1e3, (
+                    f"k={k}: |ours|={ours_abs:.2f}, |tkmkr|={tkmkr_abs:.2f}"
+                )
+            else:
+                rel = abs(ours_abs - tkmkr_abs) / tkmkr_abs
+                assert rel < tol, (
+                    f"k={k}: |ours|={ours_abs:.2f}, |tkmkr|={tkmkr_abs:.2f}, "
+                    f"rel={rel:.4f} (tol={tol})"
+                )
+
+    def test_arc_length_still_works(self, d3dlike_eq_arclen):
+        """The arc_length fallback should still produce finite results."""
+        jt = d3dlike_eq_arclen.j_tor_averaged_numerical
+        assert np.all(np.isfinite(jt))
+        assert np.any(np.abs(jt) > 0)
+
+    def test_default_is_theta(self):
+        """Default resample should be 'theta'."""
+        eq = GEQDSKEquilibrium(D3DLIKE_GFILE, nlevels=257)
+        assert eq._resample_method == "theta"
+
+    def test_read_geqdsk_passes_resample(self):
+        """read_geqdsk convenience function should pass resample parameter."""
+        eq = read_geqdsk(D3DLIKE_GFILE, nlevels=257, resample="arc_length")
+        assert eq._resample_method == "arc_length"
