@@ -1,0 +1,962 @@
+"""
+Standalone GEQDSK reader with flux-surface analysis.
+
+Reads standard GEQDSK (g-file) equilibrium files and computes
+flux-surface-averaged quantities without OMFIT or TokaMaker dependencies.
+
+Dependencies: numpy, scipy, contourpy (ships with matplotlib).
+"""
+
+import io
+import tempfile
+
+import contourpy
+import numpy as np
+from scipy import constants, integrate, interpolate
+
+
+# ---------------------------------------------------------------------------
+# Section 1: COCOS parameter table
+# ---------------------------------------------------------------------------
+
+def _cocos_params(cocos_index):
+    """Return COCOS sign/exponent parameters for a given COCOS index.
+
+    Parameters
+    ----------
+    cocos_index : int
+        COCOS convention index (1-8 or 11-18).
+
+    Returns
+    -------
+    dict with keys: sigma_Bp, sigma_RpZ, sigma_rhotp, exp_Bp
+    """
+    if cocos_index < 1 or cocos_index > 18 or cocos_index in (9, 10):
+        raise ValueError(f"Invalid COCOS index: {cocos_index}")
+
+    exp_Bp = 0 if cocos_index < 10 else 1
+
+    # Base index in 1-8 range
+    base = cocos_index if cocos_index < 10 else cocos_index - 10
+
+    # sigma_Bp: sign of poloidal flux (psi increasing outward = +1)
+    sigma_Bp = +1 if base in (1, 2, 5, 6) else -1
+
+    # sigma_RpZ: right-hand (R,phi,Z) vs (R,Z,phi) orientation
+    sigma_RpZ = +1 if base in (1, 2, 7, 8) else -1
+
+    # sigma_rhotp: sign of theta_pol*phi_tor product
+    sigma_rhotp = +1 if base in (1, 3, 5, 7) else -1
+
+    return {
+        "sigma_Bp": sigma_Bp,
+        "sigma_RpZ": sigma_RpZ,
+        "sigma_rhotp": sigma_rhotp,
+        "exp_Bp": exp_Bp,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Section 2: GEQDSK parser
+# ---------------------------------------------------------------------------
+
+def _read_geqdsk(filename):
+    """Parse a GEQDSK (g-file) into a plain dict.
+
+    Parameters
+    ----------
+    filename : str or path-like
+        Path to the g-file.
+
+    Returns
+    -------
+    dict
+        Keys match the standard GEQDSK field names (NW, NH, RDIM, ...,
+        FPOL, PRES, FFPRIM, PPRIME, PSIRZ, QPSI, RBBBS, ZBBBS, etc.).
+    """
+
+    def splitter(text, step=16):
+        return [text[step * k : step * (k + 1)] for k in range(len(text) // step)]
+
+    def merge(lines):
+        if not lines:
+            return ""
+        # Handle SOLPS-style g-files that add spaces between numbers
+        if len(lines[0]) > 80:
+            return "".join(lines).replace(" ", "")
+        return "".join(lines)
+
+    with open(filename, "r") as f:
+        EQDSK = f.read().splitlines()
+
+    g = {}
+
+    # --- Header line: CASE string, IDUM, NW, NH ---
+    g["CASE"] = np.array(splitter(EQDSK[0][:48], 8))
+    try:
+        tmp = [x for x in EQDSK[0][48:].split() if x]
+        _idum, g["NW"], g["NH"] = (int(x) for x in tmp[:3])
+    except ValueError:
+        _idum = int(EQDSK[0][48:52])
+        g["NW"] = int(EQDSK[0][52:56])
+        g["NH"] = int(EQDSK[0][56:60])
+    offset = 1
+
+    # --- 20 scalar values (4 lines x 5 values) ---
+    scalars = list(map(float, splitter(merge(EQDSK[offset : offset + 4]))))
+    (
+        g["RDIM"], g["ZDIM"], g["RCENTR"], g["RLEFT"], g["ZMID"],
+        g["RMAXIS"], g["ZMAXIS"], g["SIMAG"], g["SIBRY"], g["BCENTR"],
+        g["CURRENT"], g["SIMAG"], _, g["RMAXIS"], _,
+        g["ZMAXIS"], _, g["SIBRY"], _, _,
+    ) = scalars
+    offset += 4
+
+    NW, NH = int(g["NW"]), int(g["NH"])
+    nlNW = int(np.ceil(NW / 5.0))
+
+    # --- 1-D profiles (each NW long) ---
+    for name in ("FPOL", "PRES", "FFPRIM", "PPRIME"):
+        g[name] = np.array(list(map(float, splitter(merge(EQDSK[offset : offset + nlNW])))))
+        offset += nlNW
+
+    # --- 2-D poloidal flux: PSIRZ (NH x NW) ---
+    try:
+        nlNWNH = int(np.ceil(NW * NH / 5.0))
+        flat = np.fromiter(splitter(merge(EQDSK[offset : offset + nlNWNH])),
+                           dtype=np.float64)[: NH * NW]
+        g["PSIRZ"] = flat.reshape((NH, NW))
+        offset += nlNWNH
+    except ValueError:
+        # Some codes (e.g. FIESTA) write row-by-row
+        nlNWNH = NH * nlNW
+        flat = np.fromiter(splitter(merge(EQDSK[offset : offset + nlNWNH])),
+                           dtype=np.float64)[: NH * NW]
+        g["PSIRZ"] = flat.reshape((NH, NW))
+        offset += nlNWNH
+
+    # --- Safety factor ---
+    g["QPSI"] = np.array(list(map(float, splitter(merge(EQDSK[offset : offset + nlNW])))))
+    offset += nlNW
+
+    # --- Boundary and limiter ---
+    if len(EQDSK) > offset + 1:
+        parts = [x for x in EQDSK[offset].split() if x]
+        g["NBBBS"] = int(parts[0])
+        g["LIMITR"] = int(parts[1])
+        offset += 1
+
+        nlNBBBS = int(np.ceil(g["NBBBS"] * 2 / 5.0))
+        bnd_vals = list(map(float, splitter(merge(EQDSK[offset : offset + nlNBBBS]))))
+        g["RBBBS"] = np.array(bnd_vals[0::2])[: g["NBBBS"]]
+        g["ZBBBS"] = np.array(bnd_vals[1::2])[: g["NBBBS"]]
+        offset += max(nlNBBBS, 1)
+
+        try:
+            nlLIMITR = int(np.ceil(g["LIMITR"] * 2 / 5.0))
+            lim_vals = list(map(float, splitter(merge(EQDSK[offset : offset + nlLIMITR]))))
+            g["RLIM"] = np.array(lim_vals[0::2])[: g["LIMITR"]]
+            g["ZLIM"] = np.array(lim_vals[1::2])[: g["LIMITR"]]
+            offset += nlLIMITR
+        except ValueError:
+            # Fallback: construct rectangular limiter
+            g["LIMITR"] = 5
+            dd = g["RDIM"] / 10.0
+            R = np.linspace(0, g["RDIM"], 2) + g["RLEFT"]
+            Z = np.linspace(0, g["ZDIM"], 2) - g["ZDIM"] / 2.0 + g["ZMID"]
+            rmin = max(R[0], np.min(g["RBBBS"]) - dd)
+            rmax = min(R[1], np.max(g["RBBBS"]) + dd)
+            zmin = max(Z[0], np.min(g["ZBBBS"]) - dd)
+            zmax = min(Z[1], np.max(g["ZBBBS"]) + dd)
+            g["RLIM"] = np.array([rmin, rmax, rmax, rmin, rmin])
+            g["ZLIM"] = np.array([zmin, zmin, zmax, zmax, zmin])
+    else:
+        g["NBBBS"] = 0
+        g["LIMITR"] = 0
+        g["RBBBS"] = np.array([])
+        g["ZBBBS"] = np.array([])
+        g["RLIM"] = np.array([])
+        g["ZLIM"] = np.array([])
+
+    # --- Optional extended data (RHOVN, PCURRT, etc.) ---
+    try:
+        parts = [float(x) for x in EQDSK[offset].split() if x]
+        g["KVTOR"], g["RVTOR"], g["NMASS"] = parts[:3]
+        offset += 1
+
+        if g["KVTOR"] > 0:
+            g["PRESSW"] = np.array(list(map(float, splitter(merge(EQDSK[offset : offset + nlNW])))))
+            offset += nlNW
+            g["PWPRIM"] = np.array(list(map(float, splitter(merge(EQDSK[offset : offset + nlNW])))))
+            offset += nlNW
+
+        if g["NMASS"] > 0:
+            g["DMION"] = np.array(list(map(float, splitter(merge(EQDSK[offset : offset + nlNW])))))
+            offset += nlNW
+
+        g["RHOVN"] = np.array(list(map(float, splitter(merge(EQDSK[offset : offset + nlNW])))))
+        offset += nlNW
+    except Exception:
+        pass
+
+    # Add RHOVN if missing
+    if "RHOVN" not in g or len(g.get("RHOVN", [])) == 0:
+        g["RHOVN"] = np.sqrt(np.linspace(0, 1, NW))
+
+    # Fix missing PRES (e.g. some EAST g-files)
+    if not np.any(g["PRES"]):
+        pres = integrate.cumulative_trapezoid(
+            g["PPRIME"],
+            np.linspace(g["SIMAG"], g["SIBRY"], len(g["PPRIME"])),
+            initial=0,
+        )
+        g["PRES"] = pres - pres[-1]
+
+    return g
+
+
+# ---------------------------------------------------------------------------
+# Section 3: Contour tracing
+# ---------------------------------------------------------------------------
+
+def _trace_contours(R, Z, PSI, levels):
+    """Extract contour lines of PSI at given levels using contourpy.
+
+    Parameters
+    ----------
+    R, Z : 1-D arrays
+        Grid coordinates.
+    PSI : 2-D array (len(Z), len(R))
+        Poloidal flux on the grid.
+    levels : 1-D array
+        PSI values at which to extract contours.
+
+    Returns
+    -------
+    list of list of ndarray
+        For each level, a list of (N, 2) arrays of (R, Z) points.
+    """
+    cg = contourpy.contour_generator(R, Z, PSI, name="serial", line_type="Separate")
+    all_contours = []
+    for lev in levels:
+        segments = cg.lines(lev)
+        all_contours.append(segments)
+    return all_contours
+
+
+def _select_main_contour(segments, R0, Z0, sigma_RpZ, sigma_rhotp):
+    """Select the main closed contour encircling the magnetic axis.
+
+    Uses the winding/angular-coverage criterion: the contour whose
+    double integral of angle vs. arc-fraction has the largest amplitude
+    is most likely the one that wraps around the axis.
+
+    Parameters
+    ----------
+    segments : list of (N, 2) arrays
+        Candidate contour segments at a single PSI level.
+    R0, Z0 : float
+        Magnetic axis position.
+    sigma_RpZ, sigma_rhotp : int
+        COCOS sign factors for orientation.
+
+    Returns
+    -------
+    ndarray (N, 2) or None
+        The selected contour with correct orientation, or None if no
+        valid contour found.
+    """
+    if not segments:
+        return None
+
+    sign_theta = sigma_RpZ * sigma_rhotp
+
+    best = None
+    best_score = -1.0
+
+    for seg in segments:
+        r, z = seg[:, 0], seg[:, 1]
+        if len(r) < 4 or np.any(np.isnan(r * z)):
+            continue
+
+        # Close the contour exactly
+        r = r.copy()
+        z = z.copy()
+        r[0] = r[-1] = 0.5 * (r[0] + r[-1])
+        z[0] = z[-1] = 0.5 * (z[0] + z[-1])
+
+        # Angle from axis, unwrapped
+        theta = np.unwrap(np.arctan2(z - Z0, r - R0))
+        theta -= np.mean(theta)
+        s = np.linspace(0, 1, len(theta))
+
+        # Winding score: peak of double integral
+        score = np.max(np.abs(
+            integrate.cumulative_trapezoid(
+                integrate.cumulative_trapezoid(theta, s, initial=0), s
+            )
+        ))
+
+        if score > best_score:
+            best_score = score
+            # Determine orientation and flip if needed
+            orient = int(np.sign(
+                (z[0] - Z0) * (r[1] - r[0]) - (r[0] - R0) * (z[1] - z[0])
+            ))
+            if orient != 0:
+                best = seg[::sign_theta * orient, :]
+            else:
+                best = seg
+
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Section 4: Flux-surface geometry helper
+# ---------------------------------------------------------------------------
+
+def _flux_geometry(R, Z):
+    """Compute geometric properties of a single flux surface contour.
+
+    Parameters
+    ----------
+    R, Z : 1-D arrays
+        Contour points (should be closed: first == last, or nearly so).
+
+    Returns
+    -------
+    dict with keys: R (geometric center), Z, a (minor radius),
+        kappa, delta, perimeter, surfArea
+    """
+    geo = {}
+
+    max_r, min_r = np.max(R), np.min(R)
+    max_z, min_z = np.max(Z), np.min(Z)
+
+    imaxr = np.argmax(R)
+    z_at_max_r = Z[imaxr]
+
+    imaxz = np.argmax(Z)
+    r_at_max_z = R[imaxz]
+    iminz = np.argmin(Z)
+    r_at_min_z = R[iminz]
+
+    dl = np.sqrt(np.diff(R, prepend=R[0]) ** 2 + np.diff(Z, prepend=Z[0]) ** 2)
+
+    geo["R"] = 0.5 * (max_r + min_r)
+    geo["Z"] = 0.5 * (max_z + min_z)
+    geo["a"] = 0.5 * (max_r - min_r)
+    if geo["a"] > 0:
+        geo["kappa"] = 0.5 * (max_z - min_z) / geo["a"]
+        geo["kapu"] = (max_z - z_at_max_r) / geo["a"]
+        geo["kapl"] = (z_at_max_r - min_z) / geo["a"]
+        geo["delu"] = (geo["R"] - r_at_max_z) / geo["a"]
+        geo["dell"] = (geo["R"] - r_at_min_z) / geo["a"]
+        geo["delta"] = 0.5 * (geo["delu"] + geo["dell"])
+    else:
+        geo["kappa"] = 1.0
+        geo["kapu"] = 1.0
+        geo["kapl"] = 1.0
+        geo["delu"] = 0.0
+        geo["dell"] = 0.0
+        geo["delta"] = 0.0
+    geo["perimeter"] = np.sum(dl)
+    geo["surfArea"] = 2 * np.pi * np.sum(R * dl)
+    geo["eps"] = geo["a"] / geo["R"] if geo["R"] > 0 else 0.0
+
+    return geo
+
+
+# ---------------------------------------------------------------------------
+# Section 5: GEQDSKEquilibrium class
+# ---------------------------------------------------------------------------
+
+class GEQDSKEquilibrium:
+    """GEQDSK equilibrium with flux-surface-averaged quantities.
+
+    Reads a standard g-file and lazily computes magnetic fields,
+    flux-surface contours, averages, geometry, and inductance.
+
+    Parameters
+    ----------
+    filename : str or path-like
+        Path to the g-file.
+    cocos : int
+        COCOS convention index (default 1, standard EFIT).
+    nlevels : int
+        Number of normalised-psi levels for flux-surface analysis.
+    """
+
+    def __init__(self, filename, cocos=1, nlevels=65):
+        self._raw = _read_geqdsk(filename)
+        self._cocos = _cocos_params(cocos)
+        self._nlevels = nlevels
+        self._cache = {}
+
+    @classmethod
+    def from_bytes(cls, raw_bytes, cocos=1, nlevels=65):
+        """Construct from in-memory bytes (e.g. from HDF5 storage).
+
+        Parameters
+        ----------
+        raw_bytes : bytes
+            Raw content of a g-file.
+        cocos : int
+            COCOS index.
+        nlevels : int
+            Number of psi_N levels.
+        """
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=".geqdsk",
+                                         delete=False) as tmp:
+            tmp.write(raw_bytes)
+            tmp_path = tmp.name
+        return cls(tmp_path, cocos=cocos, nlevels=nlevels)
+
+    # --- Raw data properties ---
+
+    @property
+    def R_grid(self):
+        """1-D R grid."""
+        if "R_grid" not in self._cache:
+            NW = int(self._raw["NW"])
+            self._cache["R_grid"] = np.linspace(
+                self._raw["RLEFT"],
+                self._raw["RLEFT"] + self._raw["RDIM"],
+                NW,
+            )
+        return self._cache["R_grid"]
+
+    @property
+    def Z_grid(self):
+        """1-D Z grid."""
+        if "Z_grid" not in self._cache:
+            NH = int(self._raw["NH"])
+            self._cache["Z_grid"] = np.linspace(
+                self._raw["ZMID"] - self._raw["ZDIM"] / 2.0,
+                self._raw["ZMID"] + self._raw["ZDIM"] / 2.0,
+                NH,
+            )
+        return self._cache["Z_grid"]
+
+    @property
+    def psi_RZ(self):
+        """2-D poloidal flux array (NH x NW)."""
+        return self._raw["PSIRZ"]
+
+    @property
+    def psi_axis(self):
+        """Poloidal flux at the magnetic axis."""
+        return self._raw["SIMAG"]
+
+    @property
+    def psi_boundary(self):
+        """Poloidal flux at the last closed flux surface."""
+        return self._raw["SIBRY"]
+
+    @property
+    def psi_N(self):
+        """Normalised psi levels used for flux-surface analysis."""
+        return np.linspace(0, 1, self._nlevels)
+
+    @property
+    def fpol(self):
+        """F = R*Bt poloidal current function, on uniform psi_N grid."""
+        return self._raw["FPOL"]
+
+    @property
+    def pres(self):
+        """Pressure profile on uniform psi_N grid."""
+        return self._raw["PRES"]
+
+    @property
+    def pprime(self):
+        """dP/dpsi on uniform psi_N grid."""
+        return self._raw["PPRIME"]
+
+    @property
+    def ffprim(self):
+        """F*dF/dpsi on uniform psi_N grid."""
+        return self._raw["FFPRIM"]
+
+    @property
+    def qpsi(self):
+        """Safety factor from the g-file on uniform psi_N grid."""
+        return self._raw["QPSI"]
+
+    @property
+    def Ip(self):
+        """Plasma current [A]."""
+        return self._raw["CURRENT"]
+
+    @property
+    def R_mag(self):
+        """R of the magnetic axis [m]."""
+        return self._raw["RMAXIS"]
+
+    @property
+    def Z_mag(self):
+        """Z of the magnetic axis [m]."""
+        return self._raw["ZMAXIS"]
+
+    @property
+    def R_center(self):
+        """Reference geometric center R [m]."""
+        return self._raw["RCENTR"]
+
+    @property
+    def B_center(self):
+        """Vacuum toroidal field at R_center [T]."""
+        return self._raw["BCENTR"]
+
+    @property
+    def boundary_R(self):
+        """R coordinates of the plasma boundary."""
+        return self._raw["RBBBS"]
+
+    @property
+    def boundary_Z(self):
+        """Z coordinates of the plasma boundary."""
+        return self._raw["ZBBBS"]
+
+    @property
+    def limiter_R(self):
+        """R coordinates of the limiter."""
+        return self._raw["RLIM"]
+
+    @property
+    def limiter_Z(self):
+        """Z coordinates of the limiter."""
+        return self._raw["ZLIM"]
+
+    @property
+    def rhovn(self):
+        """Normalised toroidal flux coordinate sqrt(phi/phi_edge)."""
+        return self._raw.get("RHOVN", np.sqrt(np.linspace(0, 1, int(self._raw["NW"]))))
+
+    # --- Lazy field computation ---
+
+    def _compute_fields(self):
+        """Compute Br, Bz, Jt on the full (R, Z) grid."""
+        if "Br" in self._cache:
+            return
+
+        cc = self._cocos
+        R = self.R_grid
+        Z = self.Z_grid
+        PSI = self.psi_RZ
+        RR, _ZZ = np.meshgrid(R, Z)
+
+        dR = R[1] - R[0]
+        dZ = Z[1] - Z[0]
+        dPSIdZ, dPSIdR = np.gradient(PSI, dZ, dR)
+
+        twopi_exp = (2.0 * np.pi) ** cc["exp_Bp"]
+        self._cache["Br"] = cc["sigma_RpZ"] * cc["sigma_Bp"] * dPSIdZ / (RR * twopi_exp)
+        self._cache["Bz"] = -cc["sigma_RpZ"] * cc["sigma_Bp"] * dPSIdR / (RR * twopi_exp)
+
+        Br = self._cache["Br"]
+        Bz = self._cache["Bz"]
+        dBrdZ, dBrdR = np.gradient(Br, dZ, dR)
+        _dBzdZ, dBzdR = np.gradient(Bz, dZ, dR)
+        self._cache["Jt"] = cc["sigma_RpZ"] * (dBrdZ - dBzdR) / constants.mu_0
+
+    # --- Lazy flux-surface tracing and averaging ---
+
+    def _trace_surfaces(self):
+        """Trace flux surfaces and compute all averaged quantities."""
+        if "avg" in self._cache:
+            return
+
+        self._compute_fields()
+
+        cc = self._cocos
+        R = self.R_grid
+        Z = self.Z_grid
+
+        psi_N_levels = self.psi_N
+        dpsi = self.psi_boundary - self.psi_axis
+        psi_levels = psi_N_levels * dpsi + self.psi_axis
+
+        # Interpolators for fields
+        Br_interp = interpolate.RectBivariateSpline(Z, R, self._cache["Br"])
+        Bz_interp = interpolate.RectBivariateSpline(Z, R, self._cache["Bz"])
+        Jt_interp = interpolate.RectBivariateSpline(Z, R, self._cache["Jt"])
+
+        # Interpolator for F(psi_N)
+        NW = int(self._raw["NW"])
+        psi_N_raw = np.linspace(0, 1, NW)
+        F_interp = interpolate.InterpolatedUnivariateSpline(psi_N_raw, self._raw["FPOL"])
+        pprime_interp = interpolate.InterpolatedUnivariateSpline(psi_N_raw, self._raw["PPRIME"])
+        ffprim_interp = interpolate.InterpolatedUnivariateSpline(psi_N_raw, self._raw["FFPRIM"])
+
+        # Trace contours
+        contours = _trace_contours(R, Z, self.psi_RZ, psi_levels)
+
+        nc = len(psi_N_levels)
+        R0 = self.R_mag
+        Z0 = self.Z_mag
+
+        # Allocate averaged quantities
+        avg = {key: np.zeros(nc) for key in [
+            "R", "1/R", "1/R**2", "R**2",
+            "Bp", "Bp**2", "Bt", "Bt**2", "Btot**2",
+            "Jt", "Jt/R",
+            "vp", "q", "ip",
+            "F", "PPRIME", "FFPRIM",
+        ]}
+        geo_arrays = {key: np.zeros(nc) for key in [
+            "R", "Z", "a", "kappa", "kapu", "kapl",
+            "delta", "delu", "dell", "perimeter", "surfArea", "eps",
+        ]}
+        contour_data = []  # store (R, Z) for each surface
+
+        # Per-surface loop
+        Bp2_vol = 0.0
+        for k in range(nc):
+            pn = psi_N_levels[k]
+            F_k = float(F_interp(pn))
+            pprime_k = float(pprime_interp(pn))
+            ffprim_k = float(ffprim_interp(pn))
+
+            avg["F"][k] = F_k
+            avg["PPRIME"][k] = pprime_k
+            avg["FFPRIM"][k] = ffprim_k
+
+            if pn == 0:
+                # Magnetic axis: degenerate point
+                contour_data.append(np.array([[R0, Z0]]))
+                avg["R"][k] = R0
+                avg["1/R"][k] = 1.0 / R0
+                avg["1/R**2"][k] = 1.0 / R0**2
+                avg["R**2"][k] = R0**2
+                Bt_axis = F_k / R0
+                Br0 = float(Br_interp.ev(Z0, R0))
+                Bz0 = float(Bz_interp.ev(Z0, R0))
+                Bp0_sq = Br0**2 + Bz0**2
+                avg["Bp"][k] = 0.0
+                avg["Bp**2"][k] = Bp0_sq
+                avg["Bt"][k] = Bt_axis
+                avg["Bt**2"][k] = Bt_axis**2
+                avg["Btot**2"][k] = Bp0_sq + Bt_axis**2
+                Jt0 = float(Jt_interp.ev(Z0, R0))
+                avg["Jt"][k] = Jt0
+                avg["Jt/R"][k] = Jt0 / R0
+                avg["vp"][k] = 0.0
+                avg["ip"][k] = 0.0
+                for gk in geo_arrays:
+                    geo_arrays[gk][k] = 0.0
+                geo_arrays["R"][k] = R0
+                geo_arrays["Z"][k] = Z0
+                geo_arrays["kappa"][k] = 1.0
+                geo_arrays["kapu"][k] = 1.0
+                geo_arrays["kapl"][k] = 1.0
+                continue
+
+            # Select main contour
+            seg = _select_main_contour(
+                contours[k], R0, Z0,
+                cc["sigma_RpZ"], cc["sigma_rhotp"],
+            )
+
+            if seg is None or len(seg) < 4:
+                contour_data.append(np.array([[R0, Z0]]))
+                avg["R"][k] = R0
+                avg["1/R"][k] = 1.0 / R0
+                avg["1/R**2"][k] = 1.0 / R0**2
+                avg["R**2"][k] = R0**2
+                continue
+
+            contour_data.append(seg)
+            r_s = seg[:, 0]
+            z_s = seg[:, 1]
+
+            # Arc length
+            dl = np.sqrt(np.diff(r_s, prepend=r_s[0])**2 +
+                         np.diff(z_s, prepend=z_s[0])**2)
+
+            # Sample fields on contour
+            Br_s = Br_interp.ev(z_s, r_s)
+            Bz_s = Bz_interp.ev(z_s, r_s)
+            Jt_s = Jt_interp.ev(z_s, r_s)
+
+            Bp2_s = Br_s**2 + Bz_s**2
+            Bp_mod = np.sqrt(Bp2_s)
+
+            # Signed Bp for orientation
+            signBp = (
+                cc["sigma_rhotp"] * cc["sigma_RpZ"]
+                * np.sign((z_s - Z0) * Br_s - (r_s - R0) * Bz_s)
+            )
+            Bp_signed = signBp * Bp_mod
+
+            Bt_s = F_k / r_s
+            B2_s = Bp2_s + Bt_s**2
+
+            # Flux expansion: dl / |Bp|
+            # Avoid division by zero at any point
+            Bp_safe = np.where(Bp_mod > 1e-14, Bp_mod, 1e-14)
+            fe_dl = dl / Bp_safe
+            int_fe_dl = np.sum(fe_dl)
+
+            def flx_avg(quantity):
+                return np.sum(fe_dl * quantity) / int_fe_dl
+
+            # Averages
+            avg["R"][k] = flx_avg(r_s)
+            avg["1/R"][k] = flx_avg(1.0 / r_s)
+            avg["1/R**2"][k] = flx_avg(1.0 / r_s**2)
+            avg["R**2"][k] = flx_avg(r_s**2)
+            avg["Bp"][k] = flx_avg(Bp_signed)
+            avg["Bp**2"][k] = flx_avg(Bp2_s)
+            avg["Bt"][k] = flx_avg(Bt_s)
+            avg["Bt**2"][k] = flx_avg(Bt_s**2)
+            avg["Btot**2"][k] = flx_avg(B2_s)
+            avg["Jt"][k] = flx_avg(Jt_s)
+            avg["Jt/R"][k] = flx_avg(Jt_s / r_s)
+
+            # Volume element
+            avg["vp"][k] = (
+                cc["sigma_rhotp"] * cc["sigma_Bp"]
+                * np.sign(avg["Bp"][k])
+                * int_fe_dl
+                * (2.0 * np.pi) ** (1.0 - cc["exp_Bp"])
+            )
+
+            # Safety factor from averaging
+            avg["q"][k] = (
+                cc["sigma_rhotp"] * cc["sigma_Bp"]
+                * avg["vp"][k] * F_k * avg["1/R**2"][k]
+                / ((2 * np.pi) ** (2.0 - cc["exp_Bp"]))
+            )
+
+            # Enclosed current
+            avg["ip"][k] = (
+                cc["sigma_rhotp"]
+                * np.sum(dl * Bp_signed)
+                / (constants.mu_0)
+            )
+
+            # Geometry
+            geo_k = _flux_geometry(r_s, z_s)
+            for gk in geo_arrays:
+                if gk in geo_k:
+                    geo_arrays[gk][k] = geo_k[gk]
+
+            # Accumulate for li calculation: sum(|Bp| * dl * 2*pi) * dpsi_k
+            Bpl = np.sum(Bp_mod * dl * 2 * np.pi)
+            dpsi_k = np.abs(np.gradient(psi_levels)[k])
+            Bp2_vol += Bpl * dpsi_k
+
+        # Fix q on axis by linear extrapolation
+        if psi_N_levels[0] == 0 and nc > 2:
+            x = psi_N_levels[1:]
+            y = avg["q"][1:]
+            if len(y) >= 2:
+                avg["q"][0] = y[1] - ((y[1] - y[0]) / (x[1] - x[0])) * x[1]
+
+        # Jt/R from Grad-Shafranov (more accurate than numerical curl)
+        avg["Jt/R"] = (
+            -cc["sigma_Bp"]
+            * (avg["PPRIME"] + avg["FFPRIM"] * avg["1/R**2"] / constants.mu_0)
+            * (2.0 * np.pi) ** cc["exp_Bp"]
+        )
+
+        # Geometry: volume and cross-section area
+        psi_arr = psi_N_levels * dpsi + self.psi_axis
+        geo_arrays["vol"] = np.abs(
+            integrate.cumulative_trapezoid(avg["vp"], psi_arr, initial=0)
+        )
+        geo_arrays["cxArea"] = np.abs(
+            integrate.cumulative_trapezoid(
+                avg["vp"] * avg["1/R"], psi_arr, initial=0
+            ) / (2.0 * np.pi)
+        )
+
+        # Internal inductance
+        ip = self.Ip
+        vol = geo_arrays["vol"][-1] if geo_arrays["vol"][-1] > 0 else 1.0
+        r_0 = self.R_center if self.R_center else R0
+        circum = geo_arrays["perimeter"][-1] if geo_arrays["perimeter"][-1] > 0 else 1.0
+        a = geo_arrays["a"][-1] if geo_arrays["a"][-1] > 0 else 1.0
+        kappa_x = geo_arrays["kappa"][-1] if geo_arrays["kappa"][-1] > 0 else 1.0
+        kappa_a = vol / (2.0 * np.pi * r_0 * np.pi * a * a) if a > 0 else 1.0
+        correction_factor = (1 + kappa_x**2) / (2.0 * kappa_a) if kappa_a > 0 else 1.0
+
+        if abs(ip) > 0:
+            li_def = Bp2_vol / vol / constants.mu_0**2 / ip**2 * circum**2
+        else:
+            li_def = 0.0
+
+        li_info = {
+            "li_from_definition": li_def,
+            "li(1)": li_def / circum**2 * 2 * vol / r_0 * correction_factor if circum > 0 else 0.0,
+            "li(2)": li_def / circum**2 * 2 * vol / R0 if circum > 0 else 0.0,
+            "li(3)": 2 * Bp2_vol / r_0 / ip**2 / constants.mu_0**2 if abs(ip) > 0 else 0.0,
+        }
+
+        # Betas
+        betas = {}
+        if np.any(self._raw["PRES"]):
+            P_interp = interpolate.InterpolatedUnivariateSpline(psi_N_raw, self._raw["PRES"])
+            P_on_levels = np.array([float(P_interp(pn)) for pn in psi_N_levels])
+            Btvac = self.B_center * self.R_center / geo_arrays["R"][-1]
+            P_vol = integrate.cumulative_trapezoid(avg["vp"] * P_on_levels, psi_arr, initial=0)
+            if vol > 0 and abs(Btvac) > 0:
+                betas["beta_t"] = abs(P_vol[-1] / (Btvac**2 / 2.0 / constants.mu_0) / vol)
+                i_MA = ip / 1e6
+                betas["beta_n"] = betas["beta_t"] / abs(i_MA / a / Btvac) * 100 if abs(i_MA * a * Btvac) > 0 else 0.0
+            Bpave = ip * constants.mu_0 / circum if circum > 0 else 1.0
+            if vol > 0 and abs(Bpave) > 0:
+                betas["beta_p"] = abs(P_vol[-1] / (Bpave**2 / 2.0 / constants.mu_0) / vol)
+
+        # Store everything
+        self._cache["avg"] = avg
+        self._cache["geo"] = geo_arrays
+        self._cache["contours"] = contour_data
+        self._cache["li"] = li_info
+        self._cache["betas"] = betas
+
+    # --- Public analysis properties ---
+
+    @property
+    def j_tor_averaged(self):
+        """Flux-surface-averaged toroidal current density <Jt> [A/m^2]."""
+        self._trace_surfaces()
+        return self._cache["avg"]["Jt"]
+
+    @property
+    def j_tor_over_R(self):
+        """<Jt/R> from Grad-Shafranov equation [A/m^3]."""
+        self._trace_surfaces()
+        return self._cache["avg"]["Jt/R"]
+
+    @property
+    def q_profile(self):
+        """Safety factor from flux-surface averaging."""
+        self._trace_surfaces()
+        return self._cache["avg"]["q"]
+
+    @property
+    def li(self):
+        """Internal inductance dict with li_from_definition, li(1), li(2), li(3)."""
+        self._trace_surfaces()
+        return self._cache["li"]
+
+    @property
+    def geometry(self):
+        """Per-surface geometric quantities dict.
+
+        Keys: R, Z, a, kappa, kapu, kapl, delta, delu, dell,
+              perimeter, surfArea, eps, vol, cxArea
+        """
+        self._trace_surfaces()
+        return self._cache["geo"]
+
+    @property
+    def averages(self):
+        """All flux-surface-averaged quantities dict.
+
+        Keys: R, 1/R, 1/R**2, R**2, Bp, Bp**2, Bt, Bt**2, Btot**2,
+              Jt, Jt/R, vp, q, ip, F, PPRIME, FFPRIM
+        """
+        self._trace_surfaces()
+        return self._cache["avg"]
+
+    @property
+    def betas(self):
+        """Plasma beta values: beta_t, beta_p, beta_n."""
+        self._trace_surfaces()
+        return self._cache["betas"]
+
+    @property
+    def contours(self):
+        """List of (N, 2) contour arrays for each psi_N level."""
+        self._trace_surfaces()
+        return self._cache["contours"]
+
+    # --- Integration methods ---
+
+    def volume_integral(self, what):
+        """Volume integral of a quantity on the psi_N grid.
+
+        Parameters
+        ----------
+        what : array-like (nlevels,)
+            Quantity to integrate, sampled at self.psi_N.
+
+        Returns
+        -------
+        ndarray (nlevels,)
+            Cumulative integral from core to each surface.
+        """
+        self._trace_surfaces()
+        dpsi = self.psi_boundary - self.psi_axis
+        psi_arr = self.psi_N * dpsi + self.psi_axis
+        return integrate.cumulative_trapezoid(
+            self._cache["avg"]["vp"] * np.asarray(what), psi_arr, initial=0
+        )
+
+    def surface_integral(self, what):
+        """Cross-section integral of a quantity on the psi_N grid.
+
+        Parameters
+        ----------
+        what : array-like (nlevels,)
+            Quantity to integrate.
+
+        Returns
+        -------
+        ndarray (nlevels,)
+            Cumulative integral.
+        """
+        self._trace_surfaces()
+        dpsi = self.psi_boundary - self.psi_axis
+        psi_arr = self.psi_N * dpsi + self.psi_axis
+        return integrate.cumulative_trapezoid(
+            self._cache["avg"]["vp"] * self._cache["avg"]["1/R"] * np.asarray(what),
+            psi_arr, initial=0,
+        ) / (2.0 * np.pi)
+
+    def flux_integral(self, psi_N_val, profile):
+        """Total flux integral at a given psi_N value (scalar).
+
+        Interpolates the cumulative volume integral of `profile` to
+        the requested normalised psi.
+
+        Parameters
+        ----------
+        psi_N_val : float
+            Normalised poloidal flux location (0 = axis, 1 = boundary).
+        profile : array-like (nlevels,)
+            Profile to integrate.
+
+        Returns
+        -------
+        float
+            Value of the volume integral at psi_N_val.
+        """
+        cum = self.volume_integral(profile)
+        return float(np.interp(psi_N_val, self.psi_N, cum))
+
+
+# ---------------------------------------------------------------------------
+# Convenience function
+# ---------------------------------------------------------------------------
+
+def read_geqdsk(filename, cocos=1, nlevels=65):
+    """Read a GEQDSK file and return a GEQDSKEquilibrium object.
+
+    Parameters
+    ----------
+    filename : str or path-like
+        Path to the g-file.
+    cocos : int
+        COCOS convention index (default 1).
+    nlevels : int
+        Number of psi_N levels for flux-surface analysis.
+
+    Returns
+    -------
+    GEQDSKEquilibrium
+    """
+    return GEQDSKEquilibrium(filename, cocos=cocos, nlevels=nlevels)

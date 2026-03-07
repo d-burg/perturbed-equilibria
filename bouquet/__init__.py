@@ -2,6 +2,7 @@ from . import uncertainties
 from . import sampling
 from . import plotting
 from . import utils
+from . import io
 
 # gui is NOT imported eagerly to avoid pulling in matplotlib.pyplot
 # at package load time (breaks headless / server environments).
@@ -30,6 +31,11 @@ from .plotting import (
     plot_family,
     plot_kinetic_profiles,
     plot_jphi_profiles,
+)
+
+from .io import (
+    GEQDSKEquilibrium,
+    read_geqdsk,
 )
 
 from .utils import (
