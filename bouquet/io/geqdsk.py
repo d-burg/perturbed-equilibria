@@ -341,7 +341,12 @@ def _flux_geometry(R, Z):
     iminz = np.argmin(Z)
     r_at_min_z = R[iminz]
 
-    dl = np.sqrt(np.diff(R, prepend=R[0]) ** 2 + np.diff(Z, prepend=Z[0]) ** 2)
+    # Closed-contour arc-length: include the closing segment.
+    dR = np.diff(R, append=R[0])
+    dZ = np.diff(Z, append=Z[0])
+    dl_segs = np.sqrt(dR**2 + dZ**2)
+    # Trapezoidal weights: each point gets half of its two adjacent segments
+    dl = 0.5 * (dl_segs + np.roll(dl_segs, 1))
 
     geo["R"] = 0.5 * (max_r + min_r)
     geo["Z"] = 0.5 * (max_z + min_z)
@@ -365,6 +370,49 @@ def _flux_geometry(R, Z):
     geo["eps"] = geo["a"] / geo["R"] if geo["R"] > 0 else 0.0
 
     return geo
+
+
+def _resample_contour(R, Z, npts=257):
+    """Resample a closed contour to *npts* equally-spaced-in-arc-length points.
+
+    Uses periodic cubic spline interpolation so the result is smooth and
+    closed by construction.
+
+    Parameters
+    ----------
+    R, Z : 1-D arrays
+        Contour coordinates (should be nearly closed: first ≈ last).
+    npts : int
+        Number of output points (including the repeated closing point).
+
+    Returns
+    -------
+    R_new, Z_new : 1-D arrays of length *npts*
+    """
+    # Ensure exact closure before fitting periodic spline
+    R = np.asarray(R, dtype=float).copy()
+    Z = np.asarray(Z, dtype=float).copy()
+    R[-1], Z[-1] = R[0], Z[0]
+
+    # Cumulative arc-length parameter
+    ds = np.sqrt(np.diff(R) ** 2 + np.diff(Z) ** 2)
+    s = np.empty(len(R))
+    s[0] = 0.0
+    s[1:] = np.cumsum(ds)
+    s_total = s[-1]
+
+    if s_total < 1e-14:
+        return R, Z  # degenerate contour
+
+    # Periodic cubic spline (k=3, per=True matches OMFIT convention)
+    tck_R = interpolate.splrep(s, R, k=3, per=True)
+    tck_Z = interpolate.splrep(s, Z, k=3, per=True)
+
+    # Evaluate at equally-spaced arc-length positions
+    s_new = np.linspace(0, s_total, npts)
+    R_new = interpolate.splev(s_new, tck_R)
+    Z_new = interpolate.splev(s_new, tck_Z)
+    return R_new, Z_new
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +659,9 @@ class GEQDSKEquilibrium:
         ]}
         contour_data = []  # store (R, Z) for each surface
 
+        # Precompute dpsi spacing (once, outside the loop)
+        dpsi_arr = np.abs(np.gradient(psi_levels))
+
         # Per-surface loop
         Bp2_vol = 0.0
         for k in range(nc):
@@ -667,13 +718,20 @@ class GEQDSKEquilibrium:
                 avg["R**2"][k] = R0**2
                 continue
 
-            contour_data.append(seg)
-            r_s = seg[:, 0]
-            z_s = seg[:, 1]
+            # Resample to equally-spaced arc-length using periodic cubic
+            # spline (matches OMFIT convention).  This smooths out contourpy
+            # discretisation artefacts and gives uniform quadrature weights.
+            r_s, z_s = _resample_contour(seg[:, 0], seg[:, 1], npts=257)
+            contour_data.append(np.column_stack([r_s, z_s]))
 
-            # Arc length
-            dl = np.sqrt(np.diff(r_s, prepend=r_s[0])**2 +
-                         np.diff(z_s, prepend=z_s[0])**2)
+            # Arc length — include closing segment (append wraps back to
+            # first point so diff gives N segments for N+1-style indexing).
+            dR = np.diff(r_s, append=r_s[0])
+            dZ = np.diff(z_s, append=z_s[0])
+            dl_segs = np.sqrt(dR**2 + dZ**2)
+            # Assign each point the average of its two adjacent segments
+            # (trapezoidal quadrature weight for closed-curve integrals).
+            dl = 0.5 * (dl_segs + np.roll(dl_segs, 1))
 
             # Sample fields on contour
             Br_s = Br_interp.ev(z_s, r_s)
@@ -694,8 +752,10 @@ class GEQDSKEquilibrium:
             B2_s = Bp2_s + Bt_s**2
 
             # Flux expansion: dl / |Bp|
-            # Avoid division by zero at any point
-            Bp_safe = np.where(Bp_mod > 1e-14, Bp_mod, 1e-14)
+            # Floor |Bp| at a fraction of its surface-max to prevent
+            # X-point-adjacent spikes from dominating the average.
+            Bp_floor = max(1e-6 * np.max(Bp_mod), 1e-14)
+            Bp_safe = np.maximum(Bp_mod, Bp_floor)
             fe_dl = dl / Bp_safe
             int_fe_dl = np.sum(fe_dl)
 
@@ -737,7 +797,7 @@ class GEQDSKEquilibrium:
                 / (constants.mu_0)
             )
 
-            # Geometry
+            # Geometry (computed from resampled contour)
             geo_k = _flux_geometry(r_s, z_s)
             for gk in geo_arrays:
                 if gk in geo_k:
@@ -745,15 +805,18 @@ class GEQDSKEquilibrium:
 
             # Accumulate for li calculation: sum(|Bp| * dl * 2*pi) * dpsi_k
             Bpl = np.sum(Bp_mod * dl * 2 * np.pi)
-            dpsi_k = np.abs(np.gradient(psi_levels)[k])
-            Bp2_vol += Bpl * dpsi_k
+            Bp2_vol += Bpl * dpsi_arr[k]
 
-        # Fix q on axis by linear extrapolation
-        if psi_N_levels[0] == 0 and nc > 2:
-            x = psi_N_levels[1:]
-            y = avg["q"][1:]
-            if len(y) >= 2:
-                avg["q"][0] = y[1] - ((y[1] - y[0]) / (x[1] - x[0])) * x[1]
+        # Fix q on axis by quadratic extrapolation
+        if psi_N_levels[0] == 0 and nc > 3:
+            x = psi_N_levels[1:4]
+            y = avg["q"][1:4]
+            coeffs = np.polyfit(x, y, 2)
+            avg["q"][0] = coeffs[2]  # p(0) = c
+        elif psi_N_levels[0] == 0 and nc > 2:
+            x = psi_N_levels[1:3]
+            y = avg["q"][1:3]
+            avg["q"][0] = y[0] - (y[1] - y[0]) / (x[1] - x[0]) * x[0]
 
         # Jt/R from Grad-Shafranov (more accurate than numerical curl)
         avg["Jt/R"] = (
