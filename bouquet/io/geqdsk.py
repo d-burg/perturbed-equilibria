@@ -790,7 +790,12 @@ class GEQDSKEquilibrium:
 
         li_info = {
             "li_from_definition": li_def,
-            "li(1)": li_def / circum**2 * 2 * vol / r_0 * correction_factor if circum > 0 else 0.0,
+            # li(1)_EFIT = li_from_definition (OMFIT convention)
+            "li(1)_EFIT": li_def,
+            # li(1)_TLUCE applies a shape correction factor
+            "li(1)_TLUCE": li_def / circum**2 * 2 * vol / r_0 * correction_factor if circum > 0 else 0.0,
+            # li(1) defaults to EFIT definition (most widely used)
+            "li(1)": li_def,
             "li(2)": li_def / circum**2 * 2 * vol / R0 if circum > 0 else 0.0,
             "li(3)": 2 * Bp2_vol / r_0 / ip**2 / constants.mu_0**2 if abs(ip) > 0 else 0.0,
         }
@@ -839,7 +844,11 @@ class GEQDSKEquilibrium:
 
     @property
     def li(self):
-        """Internal inductance dict with li_from_definition, li(1), li(2), li(3)."""
+        """Internal inductance dict.
+
+        Keys: li_from_definition, li(1) [=EFIT], li(1)_EFIT, li(1)_TLUCE,
+              li(2), li(3).
+        """
         self._trace_surfaces()
         return self._cache["li"]
 
