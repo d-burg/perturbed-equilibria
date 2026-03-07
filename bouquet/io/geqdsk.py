@@ -372,11 +372,8 @@ def _flux_geometry(R, Z):
     return geo
 
 
-def _resample_contour(R, Z, npts=257):
+def _resample_contour(R, Z, npts=257, periodic=True):
     """Resample a closed contour to *npts* equally-spaced-in-arc-length points.
-
-    Uses periodic cubic spline interpolation so the result is smooth and
-    closed by construction.
 
     Parameters
     ----------
@@ -384,12 +381,19 @@ def _resample_contour(R, Z, npts=257):
         Contour coordinates (should be nearly closed: first ≈ last).
     npts : int
         Number of output points (including the repeated closing point).
+    periodic : bool
+        If *True* (default), use a periodic cubic spline so the result is
+        smooth and closed by construction.  Set to *False* for the separatrix
+        surface: the X-point cusp produces a derivative discontinuity that a
+        periodic spline would smooth out, distorting the contour.  A
+        non-periodic spline preserves the cusp while still providing uniform
+        arc-length spacing for good quadrature.
 
     Returns
     -------
     R_new, Z_new : 1-D arrays of length *npts*
     """
-    # Ensure exact closure before fitting periodic spline
+    # Ensure exact closure before fitting spline
     R = np.asarray(R, dtype=float).copy()
     Z = np.asarray(Z, dtype=float).copy()
     R[-1], Z[-1] = R[0], Z[0]
@@ -404,14 +408,20 @@ def _resample_contour(R, Z, npts=257):
     if s_total < 1e-14:
         return R, Z  # degenerate contour
 
-    # Periodic cubic spline (k=3, per=True matches OMFIT convention)
-    tck_R = interpolate.splrep(s, R, k=3, per=True)
-    tck_Z = interpolate.splrep(s, Z, k=3, per=True)
+    # Cubic spline — periodic for interior surfaces, non-periodic for
+    # the separatrix so the X-point cusp is preserved.
+    tck_R = interpolate.splrep(s, R, k=3, per=periodic)
+    tck_Z = interpolate.splrep(s, Z, k=3, per=periodic)
 
     # Evaluate at equally-spaced arc-length positions
     s_new = np.linspace(0, s_total, npts)
     R_new = interpolate.splev(s_new, tck_R)
     Z_new = interpolate.splev(s_new, tck_Z)
+
+    if not periodic:
+        # Force exact closure for the non-periodic case
+        R_new[-1], Z_new[-1] = R_new[0], Z_new[0]
+
     return R_new, Z_new
 
 
@@ -718,19 +728,17 @@ class GEQDSKEquilibrium:
                 avg["R**2"][k] = R0**2
                 continue
 
-            # Resample interior surfaces to equally-spaced arc-length using
-            # periodic cubic spline (matches OMFIT convention).  This smooths
-            # out contourpy discretisation artefacts and gives uniform
-            # quadrature weights.
-            #
-            # Skip resampling for the outermost surface (psi_N ~ 1): the
-            # separatrix has an X-point cusp where the derivative is
-            # discontinuous. Forcing per=True in splrep smooths the cusp,
-            # distorting the contour and biasing <Jt> high.  OMFIT handles
-            # this with relaxed periodicity (per=per_); we simply keep the
-            # raw contourpy points for the separatrix.
-            if pn < 1.0 - 1e-6 and len(seg) >= 20:
-                r_s, z_s = _resample_contour(seg[:, 0], seg[:, 1], npts=257)
+            # Resample to equally-spaced arc-length using cubic spline.
+            # Interior surfaces use a periodic spline (smooth and closed by
+            # construction).  The separatrix (psi_N ~ 1) uses a non-periodic
+            # spline so the X-point cusp (derivative discontinuity) is
+            # preserved — matches OMFIT's ``per=per_`` convention.
+            is_separatrix = pn >= 1.0 - 1e-6
+            if len(seg) >= 20:
+                r_s, z_s = _resample_contour(
+                    seg[:, 0], seg[:, 1], npts=257,
+                    periodic=(not is_separatrix),
+                )
             else:
                 r_s, z_s = seg[:, 0].copy(), seg[:, 1].copy()
             contour_data.append(np.column_stack([r_s, z_s]))
