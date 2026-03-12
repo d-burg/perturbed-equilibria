@@ -1,5 +1,6 @@
 from . import uncertainties
 from . import sampling
+from . import TokaMaker_interface
 from . import plotting
 from . import utils
 from . import io
@@ -14,6 +15,10 @@ from .sampling import (
     generate_perturbed_GPR,
     verify_gpr_statistics,
     calc_cylindrical_li_proxy,
+)
+
+from .TokaMaker_interface import (
+    fit_inductive_profile,
     perturb_kinetic_equilibrium,
     generate_perturbed_equilibria,
 )
@@ -29,6 +34,7 @@ from .plotting import (
     draw_jphi_components,
     draw_jphi_profiles,
     plot_family,
+    plot_tokamaker_comparison,
     plot_kinetic_profiles,
     plot_jphi_profiles,
 )
