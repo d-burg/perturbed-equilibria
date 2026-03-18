@@ -43,6 +43,8 @@ from .plotting import (
 from .io import (
     GEQDSKEquilibrium,
     read_geqdsk,
+    PFile,
+    read_pfile,
 )
 
 from .utils import (
