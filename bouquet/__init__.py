@@ -13,6 +13,7 @@ from . import io
 from .sampling import (
     GPRProfilePerturber,
     generate_perturbed_GPR,
+    sigmoid_length_scale,
     verify_gpr_statistics,
     calc_cylindrical_li_proxy,
 )
@@ -20,7 +21,7 @@ from .sampling import (
 from .TokaMaker_interface import (
     fit_inductive_profile,
     perturb_kinetic_equilibrium,
-    generate_perturbed_equilibria,
+    generate_bouquet,
     reconstruct_equilibrium,
 )
 
@@ -34,8 +35,11 @@ from .plotting import (
     draw_jphi_total,
     draw_jphi_components,
     draw_jphi_profiles,
-    plot_family,
+    plot_bouquet,
     plot_tokamaker_comparison,
+    plot_geqdsk_bouquet,
+    plot_pfile_bouquet,
+    plot_coil_currents,
     plot_kinetic_profiles,
     plot_jphi_profiles,
 )

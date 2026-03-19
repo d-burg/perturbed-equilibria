@@ -5,7 +5,7 @@ Provides:
   - Core drawing functions (``draw_kinetic_profiles``,
     ``draw_pressure_profiles``, ``draw_jphi_profiles``) that operate
     on pre-loaded data arrays and matplotlib axes.
-  - ``plot_family`` -- self-contained notebook-friendly API that loads
+  - ``plot_bouquet`` -- self-contained notebook-friendly API that loads
     everything from the ``.h5`` file and returns ``(fig, axes)``.
   - ``plot_tokamaker_comparison`` -- overview / single-shot comparison
     of TokaMaker reconstructions against source geqdsk files.
@@ -18,6 +18,7 @@ Provides:
 import os
 import warnings
 
+import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -26,6 +27,7 @@ from .utils import (
     load_equilibrium_by_path,
     load_baseline_profiles,
     count_equilibria,
+    discover_scan_values,
 )
 from .io import read_geqdsk
 
@@ -715,10 +717,44 @@ def _load_all_perturbations(h5path, scan_value=None):
     ]
 
 
+def _load_all_boundaries(h5path, scan_value=None):
+    """Load LCFS boundaries from stored geqdsk bytes for all equilibria.
+
+    Returns a list of (R, Z) tuples.  Returns an empty list when the
+    HDF5 file does not contain geqdsk bytes.
+    """
+    from .io import GEQDSKEquilibrium
+    from .utils import _scan_val_key, _group_path, _eqdsk_dataset_name
+
+    n = count_equilibria(h5path, scan_value=scan_value)
+    boundaries = []
+    with h5py.File(h5path, "r") as hf:
+        for i in range(n):
+            sv_key = _scan_val_key(scan_value)
+            grp_path = _group_path(scan_value, i)
+            if grp_path not in hf:
+                continue
+            grp = hf[grp_path]
+
+            # Find the eqdsk dataset (name ends with .eqdsk)
+            eqdsk_ds = [k for k in grp.keys() if k.endswith(".eqdsk")]
+            if not eqdsk_ds:
+                continue
+
+            raw = bytes(grp[eqdsk_ds[0]][()])
+            try:
+                eq = GEQDSKEquilibrium.from_bytes(raw)
+                boundaries.append((eq.boundary_R, eq.boundary_Z))
+            except Exception:
+                continue
+
+    return boundaries
+
+
 # ====================================================================
 #  Notebook-friendly API
 # ====================================================================
-def plot_family(h5path_or_header, scan_value=None, mode="kinetic"):
+def plot_bouquet(h5path_or_header, scan_value=None, mode="kinetic"):
     """Plot a family of perturbed equilibria from an HDF5 file.
 
     Parameters
@@ -729,7 +765,8 @@ def plot_family(h5path_or_header, scan_value=None, mode="kinetic"):
     scan_value : str, float, or None
         Baseline scan-value label.  ``None`` for flat-layout files.
     mode : str
-        ``'kinetic'``, ``'pressure'``, ``'j-phi'``, or ``'all'``.
+        ``'kinetic'``, ``'pressure'``, ``'j-phi'``, ``'boundary'``,
+        or ``'all'``.
 
     Returns
     -------
@@ -743,7 +780,15 @@ def plot_family(h5path_or_header, scan_value=None, mode="kinetic"):
         h5path = os.path.abspath(h5path_or_header)
 
     # ---- load data -------------------------------------------------------
-    bl = load_baseline_profiles(h5path, scan_value=scan_value)
+    try:
+        bl = load_baseline_profiles(h5path, scan_value=scan_value)
+    except KeyError:
+        avail = discover_scan_values(h5path)
+        msg = (
+            f"No data for scan_value={scan_value!r} in {h5path}.\n"
+            f"Available scan values: {avail}"
+        )
+        raise KeyError(msg) from None
     psi_N = bl["psi_N"]
     perturbed = _load_all_perturbations(h5path, scan_value=scan_value)
 
@@ -794,6 +839,52 @@ def plot_family(h5path_or_header, scan_value=None, mode="kinetic"):
         figs.append(fig_jc)
         axes_list.append(ax_jc)
 
+    if mode in ("boundary", "all"):
+        boundaries = _load_all_boundaries(h5path, scan_value=scan_value)
+        if boundaries:
+            fig_bd, ax_bd = plt.subplots(1, 2, figsize=(10, 5))
+
+            # Panel (a): overlaid LCFS contours — baseline behind
+            bR0, bZ0 = boundaries[0]
+            ax_bd[0].plot(bR0, bZ0, "b-", lw=1.5, label="Baseline",
+                          zorder=1)
+            for i, (bR, bZ) in enumerate(boundaries[1:], 1):
+                lbl = "Perturbed" if i == 1 else None
+                ax_bd[0].plot(bR, bZ, "-", color="C1", lw=0.6,
+                              alpha=0.5, label=lbl, zorder=2)
+            ax_bd[0].set_aspect("equal")
+            ax_bd[0].set_xlabel("R [m]")
+            ax_bd[0].set_ylabel("Z [m]")
+            ax_bd[0].set_title("LCFS shape variation")
+            ax_bd[0].legend(fontsize=8)
+            ax_bd[0].grid(ls=":")
+
+            # Panel (b): max and RMS deviation per equilibrium
+            ref_pts = np.column_stack([bR0, bZ0])
+            tree = _cKDTree(ref_pts)
+            max_devs = []
+            rms_devs = []
+            for bR, bZ in boundaries[1:]:
+                pts = np.column_stack([bR, bZ])
+                dists, _ = tree.query(pts)
+                max_devs.append(np.max(dists) * 1e3)   # mm
+                rms_devs.append(np.sqrt(np.mean(dists**2)) * 1e3)
+
+            if max_devs:
+                x_idx = np.arange(len(max_devs))
+                w = 0.35
+                ax_bd[1].bar(x_idx - w/2, max_devs, w, label="Max", color="C3", alpha=0.7)
+                ax_bd[1].bar(x_idx + w/2, rms_devs, w, label="RMS", color="C0", alpha=0.7)
+                ax_bd[1].set_xlabel("Perturbation index")
+                ax_bd[1].set_ylabel("Boundary deviation [mm]")
+                ax_bd[1].set_title("LCFS deviation from baseline")
+                ax_bd[1].legend(fontsize=8)
+                ax_bd[1].grid(ls=":")
+
+            fig_bd.tight_layout()
+            figs.append(fig_bd)
+            axes_list.append(ax_bd)
+
     if mode == "all":
         return figs, axes_list
     if len(figs) == 1:
@@ -806,9 +897,9 @@ def plot_family(h5path_or_header, scan_value=None, mode="kinetic"):
 # ====================================================================
 def plot_kinetic_profiles(header, n_equils, psi_N, ne, ni, te, ti,
                           sigma_ne, sigma_ni, sigma_te, sigma_ti):
-    """**Deprecated** -- use :func:`plot_family` instead."""
+    """**Deprecated** -- use :func:`plot_bouquet` instead."""
     warnings.warn(
-        "plot_kinetic_profiles() is deprecated.  Use plot_family() instead.",
+        "plot_kinetic_profiles() is deprecated.  Use plot_bouquet() instead.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -824,9 +915,9 @@ def plot_kinetic_profiles(header, n_equils, psi_N, ne, ni, te, ti,
 
 
 def plot_jphi_profiles(psi_N, input_j_phi, sigma_jphi, header, n_equils):
-    """**Deprecated** -- use :func:`plot_family` instead."""
+    """**Deprecated** -- use :func:`plot_bouquet` instead."""
     warnings.warn(
-        "plot_jphi_profiles() is deprecated.  Use plot_family() instead.",
+        "plot_jphi_profiles() is deprecated.  Use plot_bouquet() instead.",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -838,3 +929,514 @@ def plot_jphi_profiles(psi_N, input_j_phi, sigma_jphi, header, n_equils):
     )
     plt.tight_layout()
     plt.show()
+
+
+# =====================================================================
+# Standalone GEQDSK and p-file plotting for DIII-D / OMFIT workflows
+# =====================================================================
+
+def _resolve_x_coord(psi_N, x_coord, eq=None, psi_pf=None):
+    """Return (x_values, x_label) for the chosen radial coordinate.
+
+    For ``"rho"`` an equilibrium object with ``rhovn`` is required.
+    When *psi_pf* is provided (p-file grid different from g-file),
+    the rho mapping is interpolated onto it.
+    """
+    if x_coord == "psi_N":
+        x = psi_pf if psi_pf is not None else psi_N
+        return x, r"$\psi_N$"
+    elif x_coord == "rho":
+        if eq is None:
+            raise ValueError(
+                "x_coord='rho' requires an eq (GEQDSKEquilibrium) "
+                "for the rhovn mapping"
+            )
+        from scipy.interpolate import interp1d
+        psi_eq = np.linspace(0, 1, len(eq.rhovn))
+        grid = psi_pf if psi_pf is not None else psi_N
+        rho = interp1d(psi_eq, eq.rhovn, fill_value="extrapolate")(grid)
+        return rho, r"$\rho$"
+    else:
+        raise ValueError(f"x_coord must be 'psi_N' or 'rho', got {x_coord!r}")
+
+
+def plot_geqdsk_bouquet(geqdsk_path_or_eq=None, x_coord="psi_N",
+                        h5path=None, scan_val=None, count=None):
+    """Plot one or more geqdsk equilibria: LCFS contours + profile panels.
+
+    Layout: narrow flux-surface panel on the left, 2x2 grid of profiles
+    on the right (pressure, q, |j_phi|, normalized P' and FF').
+
+    Usage modes:
+
+    1. **Single file:**
+       ``plot_geqdsk_bouquet("shot.geqdsk")``
+
+    2. **All perturbed from HDF5 (all scan values overplotted):**
+       ``plot_geqdsk_bouquet(h5path="header.h5")``
+
+    3. **All perturbed from HDF5 for one scan value:**
+       ``plot_geqdsk_bouquet(h5path="header.h5", scan_val=0)``
+
+    4. **Single perturbed case from HDF5:**
+       ``plot_geqdsk_bouquet(h5path="header.h5", scan_val=0, count=2)``
+
+    5. **Multiple files overplotted:**
+       ``plot_geqdsk_bouquet(["a.geqdsk", "b.geqdsk"])``
+
+    Parameters
+    ----------
+    geqdsk_path_or_eq : str, GEQDSKEquilibrium, list, or None
+        Path(s) to g-file(s), or already-loaded equilibrium object(s).
+        When a list is provided, all equilibria are overplotted.
+        ``None`` when loading from *h5path*.
+    x_coord : ``"psi_N"`` or ``"rho"``
+        Radial coordinate for the profile panels.
+    h5path : str or None
+        Path to a bouquet HDF5 database.  When provided, loads and
+        overplots all stored geqdsk equilibria (or a single one if
+        *count* is specified).  When *scan_val* is ``None``, loads
+        all scan values.
+    scan_val : str, float, or None
+        Scan-value label for HDF5 mode.  ``None`` loads all.
+    count : int or None
+        If given with *h5path*, load only this equilibrium index.
+
+    Returns
+    -------
+    fig, axes
+    """
+    from .io import GEQDSKEquilibrium
+
+    # --- resolve inputs to a list of equilibrium objects ---
+    if h5path is not None:
+        if not h5path.endswith(".h5"):
+            h5path = os.path.abspath(f"{h5path}.h5")
+
+        # Build list of (scan_val, count) pairs to load
+        load_pairs = []
+        if count is not None:
+            load_pairs.append((scan_val, count))
+        elif scan_val is not None:
+            n = count_equilibria(h5path, scan_value=scan_val)
+            load_pairs.extend((scan_val, i) for i in range(n))
+        else:
+            # No scan_val specified: load ALL scan values
+            svs = discover_scan_values(h5path)
+            if svs is not None:
+                for sv in svs:
+                    n = count_equilibria(h5path, scan_value=sv)
+                    load_pairs.extend((sv, i) for i in range(n))
+            else:
+                n = count_equilibria(h5path, scan_value=None)
+                load_pairs.extend((None, i) for i in range(n))
+
+        eqs = []
+        from .utils import _group_path
+        for sv, idx in load_pairs:
+            grp_path = _group_path(sv, idx)
+            with h5py.File(h5path, "r") as hf:
+                if grp_path not in hf:
+                    continue
+                grp = hf[grp_path]
+                eqdsk_ds = [k for k in grp.keys() if k.endswith(".eqdsk")]
+                if eqdsk_ds:
+                    raw = bytes(grp[eqdsk_ds[0]][()])
+                    eqs.append(GEQDSKEquilibrium.from_bytes(raw))
+        if not eqs:
+            print("No geqdsk data found in HDF5.")
+            return None, None
+    elif geqdsk_path_or_eq is not None:
+        inputs = geqdsk_path_or_eq
+        if not isinstance(inputs, (list, tuple)):
+            inputs = [inputs]
+        eqs = []
+        for inp in inputs:
+            if isinstance(inp, str):
+                eqs.append(read_geqdsk(inp))
+            else:
+                eqs.append(inp)
+    else:
+        raise ValueError("Provide geqdsk_path_or_eq or h5path")
+
+    n_eq = len(eqs)
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_eq, 10)))
+
+    fig = plt.figure(figsize=(14, 6))
+    gs = fig.add_gridspec(2, 3, width_ratios=[0.6, 1, 1],
+                          wspace=0.35, hspace=0.35)
+
+    ax_lcfs = fig.add_subplot(gs[:, 0])
+    ax_p = fig.add_subplot(gs[0, 1])
+    ax_q = fig.add_subplot(gs[0, 2])
+    ax_j = fig.add_subplot(gs[1, 1])
+    ax_ff = fig.add_subplot(gs[1, 2])
+
+    # Plot baseline first (behind), then perturbed on top.
+    # All lines have the same width so perturbed traces are clearly visible.
+    for idx in [0] + list(range(1, n_eq)):
+        eq = eqs[idx]
+        is_baseline = (idx == 0)
+        if is_baseline:
+            c = "k"
+            lw = 1.5
+            alpha = 1.0
+            lbl = "Baseline" if n_eq > 1 else None
+        else:
+            c = "C1"
+            lw = 1.0
+            alpha = 0.7
+            lbl = "Perturbed" if idx == 1 else None
+
+        psi_N = np.linspace(0, 1, len(eq.pres))
+        x, xlabel = _resolve_x_coord(psi_N, x_coord, eq=eq)
+
+        # LCFS
+        if is_baseline:
+            ax_lcfs.contour(eq.R_grid, eq.Z_grid, eq.psi_RZ,
+                            levels=30, colors="0.6", linewidths=0.4)
+            if eq.limiter_R is not None and len(eq.limiter_R) > 0:
+                ax_lcfs.plot(eq.limiter_R, eq.limiter_Z, "k-", lw=1.0,
+                             label="Limiter")
+        ax_lcfs.plot(eq.boundary_R, eq.boundary_Z, "-", color=c,
+                     lw=lw, alpha=alpha, label=lbl if lbl and "LCFS" not in str(lbl) else lbl)
+
+        # Pressure
+        ax_p.plot(x, eq.pres / 1e3, "-", color=c, lw=lw, alpha=alpha, label=lbl)
+
+        # q
+        ax_q.plot(x, eq.qpsi, "-", color=c, lw=lw, alpha=alpha, label=lbl)
+
+        # |j_phi|
+        jt = eq.j_tor_averaged
+        ax_j.plot(x, np.abs(jt) / 1e6, "-", color=c, lw=lw, alpha=alpha, label=lbl)
+
+        # Normalized P' and FF'
+        pp = eq.pprime
+        ff = eq.ffprim
+        pp_max = np.max(np.abs(pp)) if np.max(np.abs(pp)) > 0 else 1.0
+        ff_max = np.max(np.abs(ff)) if np.max(np.abs(ff)) > 0 else 1.0
+        if is_baseline:
+            ax_ff.plot(x, pp / pp_max, "-", color="r", lw=lw,
+                       label=r"$p' / |p'|_{\max}$")
+            ax_ff.plot(x, ff / ff_max, "--", color="b", lw=lw,
+                       label=r"$FF' / |FF'|_{\max}$")
+        else:
+            ax_ff.plot(x, pp / pp_max, "-", color="r", lw=lw, alpha=alpha)
+            ax_ff.plot(x, ff / ff_max, "--", color="b", lw=lw, alpha=alpha)
+
+    # Labels and formatting (use first eq for sign labels)
+    eq0 = eqs[0]
+    Bt_sign = "+" if eq0.B_center >= 0 else "-"
+    Ip_sign = "+" if eq0.Ip >= 0 else "-"
+
+    ax_lcfs.set_aspect("equal")
+    ax_lcfs.set_xlabel("R [m]")
+    ax_lcfs.set_ylabel("Z [m]")
+    ax_lcfs.set_title("Flux surfaces")
+    if n_eq > 1:
+        ax_lcfs.legend(fontsize=6)
+    ax_lcfs.grid(ls=":")
+
+    ax_p.set_ylabel("Pressure [kPa]")
+    ax_p.set_title("Pressure")
+    ax_p.grid(ls=":")
+
+    ax_q.set_ylabel("q")
+    ax_q.set_title("Safety factor")
+    ax_q.grid(ls=":")
+
+    ax_j.set_xlabel(xlabel)
+    ax_j.set_ylabel(r"$|\langle J_\phi \rangle|$ [MA/m$^2$]")
+    ax_j.set_title(
+        rf"$|J_\phi|$ (std)  [$B_t$:{Bt_sign}, $I_p$:{Ip_sign}]"
+    )
+    ax_j.grid(ls=":")
+
+    ax_ff.set_xlabel(xlabel)
+    ax_ff.set_ylabel("Normalized")
+    ax_ff.set_title(r"$p'$ and $FF'$ (normalized)")
+    ax_ff.legend(fontsize=7)
+    ax_ff.grid(ls=":")
+
+    if n_eq > 1:
+        ax_p.legend(fontsize=6)
+
+    plt.tight_layout()
+    return fig, fig.axes
+
+
+def plot_pfile_bouquet(pfile_path_or_pf=None, x_coord="psi_N", eq=None,
+                       h5path=None, scan_val=None, count=None):
+    """Plot one or more p-file kinetic profiles in a multi-panel grid.
+
+    Automatically includes all available profiles, skipping any that
+    are absent.  Zeff is computed on the fly if ion species data is
+    available.
+
+    Usage modes:
+
+    1. **Single file:**
+       ``plot_pfile_bouquet("shot.peqdsk")``
+
+    2. **All perturbed from HDF5 (requires pfile_bytes stored):**
+       ``plot_pfile_bouquet(h5path="header.h5", scan_val=0)``
+
+    3. **Single perturbed case from HDF5:**
+       ``plot_pfile_bouquet(h5path="header.h5", scan_val=0, count=2)``
+
+    4. **Multiple files overplotted:**
+       ``plot_pfile_bouquet(["a.peqdsk", "b.peqdsk"])``
+
+    .. note::
+       HDF5 mode requires that ``pfile_bytes`` was passed to
+       ``generate_bouquet()`` or ``store_equilibrium()`` when the
+       data was generated.  If no p-file data is stored, use the
+       file-path mode instead.
+
+    Parameters
+    ----------
+    pfile_path_or_pf : str, PFile, list, or None
+        Path(s) to p-file(s), or already-loaded PFile object(s).
+        When a list is provided, all p-files are overplotted.
+        ``None`` when loading from *h5path*.
+    x_coord : ``"psi_N"`` or ``"rho"``
+        Radial coordinate.  ``"rho"`` requires *eq*.
+    eq : GEQDSKEquilibrium or None
+        Required when ``x_coord="rho"`` to provide the rhovn mapping.
+    h5path : str or None
+        Path to a bouquet HDF5 database.  When provided, loads and
+        overplots all stored p-file equilibria.
+    scan_val : str, float, or None
+        Scan-value label for HDF5 mode.
+    count : int or None
+        If given with *h5path*, load only this p-file index.
+
+    Returns
+    -------
+    fig, axes
+    """
+    from .io.pfile import PFile as _PFile, read_pfile as _read_pf
+
+    # --- resolve inputs to a list of PFile objects ---
+    if h5path is not None:
+        if not h5path.endswith(".h5"):
+            h5path = os.path.abspath(f"{h5path}.h5")
+
+        # Build list of (scan_val, count) pairs to load
+        load_pairs = []
+        if count is not None:
+            load_pairs.append((scan_val, count))
+        elif scan_val is not None:
+            n = count_equilibria(h5path, scan_value=scan_val)
+            load_pairs.extend((scan_val, i) for i in range(n))
+        else:
+            svs = discover_scan_values(h5path)
+            if svs is not None:
+                for sv in svs:
+                    n = count_equilibria(h5path, scan_value=sv)
+                    load_pairs.extend((sv, i) for i in range(n))
+            else:
+                n = count_equilibria(h5path, scan_value=None)
+                load_pairs.extend((None, i) for i in range(n))
+
+        pfiles = []
+        from .utils import _group_path
+        for sv, idx in load_pairs:
+            grp_path = _group_path(sv, idx)
+            with h5py.File(h5path, "r") as hf:
+                if grp_path not in hf:
+                    continue
+                grp = hf[grp_path]
+                pf_ds = [k for k in grp.keys() if k.endswith(".pfile")]
+                if pf_ds:
+                    raw = bytes(grp[pf_ds[0]][()])
+                    pfiles.append(_PFile.from_bytes(raw))
+        if not pfiles:
+            print("No p-file data found in HDF5. "
+                  "Pass pfile_bytes to generate_bouquet() to store p-files.")
+            return None, None
+    elif pfile_path_or_pf is not None:
+        inputs = pfile_path_or_pf
+        if not isinstance(inputs, (list, tuple)):
+            inputs = [inputs]
+        pfiles = []
+        for inp in inputs:
+            if isinstance(inp, str):
+                pfiles.append(_read_pf(inp))
+            else:
+                pfiles.append(inp)
+    else:
+        raise ValueError("Provide pfile_path_or_pf or h5path")
+
+    n_pf = len(pfiles)
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_pf, 10)))
+
+    # Define the panel catalogue: (raw_key, label, units, special)
+    _PANEL_KEYS = [
+        ("ne",    r"$n_e$",                  r"$10^{20}$/m$^3$"),
+        ("te",    r"$T_e$",                  "keV"),
+        ("ni",    r"$n_i$",                  r"$10^{20}$/m$^3$"),
+        ("ti",    r"$T_i$",                  "keV"),
+        ("ptot",  r"$p_{\rm tot}$",          "kPa"),
+        ("pb",    r"$p_b$ (fast)",           "kPa"),
+        ("nz1",   r"$n_{z1}$",              r"$10^{20}$/m$^3$"),
+        ("nb",    r"$n_b$ (beam)",           r"$10^{20}$/m$^3$"),
+        ("zeff",  r"$Z_{\rm eff}$",          ""),          # computed
+        ("omeg",  r"$\omega_\phi$ (tor)",    "kRad/s"),
+        ("omegp", r"$\omega_\theta$ (pol)",  "kRad/s"),
+        ("omgeb", r"$\omega_{E \times B}$",  "kRad/s"),
+        ("omgpp", r"$\omega_{\rm dia}$",     "kRad/s"),
+        ("er",    r"$E_r$",                  "kV/m"),
+        ("omghb", r"$\omega_{\rm HB}$",      "kRad/s"),
+        ("kpol",  r"$K_{\rm pol}$",          ""),
+    ]
+
+    # Determine which panels have data in at least one p-file
+    active_keys = []
+    for key, label, units in _PANEL_KEYS:
+        for pf in pfiles:
+            if key == "zeff":
+                if (pf.ion_species is not None
+                        and pf.ne is not None and pf.ni is not None):
+                    active_keys.append((key, label, units))
+                    break
+            elif pf._get_data(key) is not None:
+                active_keys.append((key, label, units))
+                break
+
+    n = len(active_keys)
+    if n == 0:
+        print("No profiles to plot.")
+        return None, None
+
+    ncols = min(n, 5)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(3.2 * ncols, 2.8 * nrows),
+                             squeeze=False)
+
+    for panel_idx, (key, label, units) in enumerate(active_keys):
+        r, c = divmod(panel_idx, ncols)
+        ax = axes[r][c]
+
+        # Plot baseline first (behind), then perturbed on top.
+        draw_order = [0] + list(range(1, n_pf))
+        for pf_idx in draw_order:
+            pf = pfiles[pf_idx]
+            is_baseline = (pf_idx == 0)
+            if is_baseline:
+                col, lw, alpha = "k", 1.5, 1.0
+                lbl = "Baseline" if n_pf > 1 and panel_idx == 0 else None
+            else:
+                col, lw, alpha = "C1", 1.0, 0.7
+                lbl = ("Perturbed" if pf_idx == 1 and panel_idx == 0
+                       else None)
+
+            if key == "zeff":
+                if (pf.ion_species is not None
+                        and pf.ne is not None and pf.ni is not None):
+                    try:
+                        psi_z, zeff = pf.compute_zeff()
+                        x, xlabel = _resolve_x_coord(
+                            None, x_coord, eq=eq, psi_pf=psi_z)
+                        ax.plot(x, zeff, "-", color=col, lw=lw,
+                                alpha=alpha, label=lbl)
+                    except Exception:
+                        pass
+            else:
+                d = pf._get_data(key)
+                if d is not None:
+                    psi_pf = pf.psinorm_for(key)
+                    x, xlabel = _resolve_x_coord(
+                        None, x_coord, eq=eq, psi_pf=psi_pf)
+                    ax.plot(x, d, "-", color=col, lw=lw,
+                            alpha=alpha, label=lbl)
+
+        ax.set_title(label, fontsize=10)
+        if units:
+            ax.set_ylabel(units, fontsize=8)
+        if r == nrows - 1:
+            ax.set_xlabel(xlabel, fontsize=8)
+        ax.grid(ls=":")
+
+    # Legend on the first panel when overplotting
+    if n_pf > 1 and n > 0:
+        axes[0][0].legend(fontsize=6)
+
+    # Hide unused axes
+    for idx in range(n, nrows * ncols):
+        r, c = divmod(idx, ncols)
+        axes[r][c].set_visible(False)
+
+    plt.tight_layout()
+    return fig, axes
+
+
+def plot_coil_currents(h5path_or_header, scan_val=None):
+    """Plot coil current variation across a bouquet of equilibria.
+
+    Shows individual equilibria as thin gray lines and overlays the
+    mean with error bars.
+
+    Parameters
+    ----------
+    h5path_or_header : str
+        Path to the ``.h5`` file or header string.
+    scan_val : str, float, or None
+        Scan-value label.
+
+    Returns
+    -------
+    fig, ax
+    """
+    h5path = h5path_or_header
+    if not h5path.endswith(".h5"):
+        h5path = os.path.abspath(f"{h5path}.h5")
+
+    n = count_equilibria(h5path, scan_value=scan_val)
+    if n == 0:
+        print("No equilibria found.")
+        return None, None
+
+    all_cc = []
+    for i in range(n):
+        entry = load_equilibrium_by_path(h5path, count=i,
+                                         scan_value=scan_val)
+        if "coil_currents" in entry:
+            all_cc.append(entry["coil_currents"])
+
+    if not all_cc:
+        print("No coil current data found in the HDF5 file.")
+        return None, None
+
+    names = list(all_cc[0].keys())
+    values = np.array([[cc[nm] for nm in names] for cc in all_cc])
+
+    fig, ax = plt.subplots(figsize=(max(10, 0.5 * len(names)), 5))
+
+    # Baseline (count=0) in the back
+    baseline_vals = values[0] / 1e3
+    ax.plot(names, baseline_vals, "s-", color="C0", lw=2.0, ms=5,
+            zorder=1, label="Baseline")
+
+    # Perturbed equilibria (count>=1)
+    for i in range(1, len(all_cc)):
+        ax.plot(names, values[i] / 1e3, "-", color="0.7", lw=0.8, alpha=0.5,
+                zorder=2)
+
+    # Mean ± std on top of everything
+    if len(all_cc) > 1:
+        pert_vals = values[1:]
+        mean = pert_vals.mean(axis=0) / 1e3
+        std = pert_vals.std(axis=0) / 1e3
+        ax.errorbar(names, mean, yerr=std, fmt="ko-", lw=1.2, capsize=3,
+                    ms=3, zorder=3, label=r"Perturbed mean $\pm$ 1$\sigma$")
+
+    ax.set_ylabel("Coil current [kA]")
+    ax.set_title("Coil currents across bouquet")
+    ax.legend(fontsize=8)
+    ax.grid(ls=":")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    return fig, ax

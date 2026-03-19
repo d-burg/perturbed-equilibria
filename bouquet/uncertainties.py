@@ -9,6 +9,7 @@ def new_uncertainty_profiles(
     psi_N,
     uncertainty,
     falloff_exp=None,
+    shelf=0.0,
     edge_val=0.0,
     falloff_loc=0.8,
     tail_alpha=2.5,
@@ -18,13 +19,18 @@ def new_uncertainty_profiles(
     Two modes are supported:
 
     * **Power-law mode** (``falloff_exp`` is not ``None``):
-      :math:`u(\hat{\psi}) = U\,(1 - \hat{\psi})^{\mathrm{falloff\_exp}}`
+      :math:`u(\hat{\psi}) = U\,(1 - \hat{\psi})^{\mathrm{falloff\_exp}} + S`
+
+      where *S* is the ``shelf`` parameter — a minimum fractional
+      uncertainty that prevents the envelope from decaying to zero at
+      the edge.
 
     * **Flat + tail mode** (default, ``falloff_exp`` is ``None``):
       constant value :math:`U` for
       :math:`\hat{\psi} \le \hat{\psi}_{\rm loc}`, then a cosine
       (or cosh) decay to ``edge_val`` at :math:`\hat{\psi}=1`
-      controlled by ``tail_alpha``.
+      controlled by ``tail_alpha``.  The shelf is added after the
+      tail decay.
 
     Parameters
     ----------
@@ -34,6 +40,9 @@ def new_uncertainty_profiles(
         Scalar amplitude :math:`U` of the envelope.
     falloff_exp : float or None
         Exponent for the power-law branch (``None`` selects flat + tail).
+    shelf : float
+        Minimum fractional uncertainty floor added to the envelope.
+        Prevents the profile from decaying all the way to zero.
     edge_val : float
         Envelope value at :math:`\hat{\psi}=1` (flat + tail mode).
     falloff_loc : float
@@ -48,7 +57,7 @@ def new_uncertainty_profiles(
     """
     # ---- power-law branch -------------------------------------------
     if falloff_exp is not None:
-        return uncertainty * (1.0 - psi_N) ** falloff_exp
+        return uncertainty * (1.0 - psi_N) ** falloff_exp + shelf
 
     # ---- flat + cosine/cosh tail branch -----------------------------
     profile_left = uncertainty * np.ones_like(psi_N)
@@ -78,4 +87,4 @@ def new_uncertainty_profiles(
     if edge_val >= 0.0:
         profile = np.maximum(profile, 0.0)
 
-    return profile
+    return profile + shelf

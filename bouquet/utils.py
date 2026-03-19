@@ -64,28 +64,28 @@ def Hmode_profiles(edge=0.08, ped=0.4, core=2.5, rgrid=201, expin=1.5, expout=1.
 
     return val
 
-def _baseline_key(baseline):
-    """Convert a baseline label (float, int, or str) to an HDF5-safe string.
+def _scan_val_key(scan_val):
+    """Convert a scan-value label (float, int, or str) to an HDF5-safe string.
 
-    Returns ``None`` when *baseline* is ``None`` (flat layout).
+    Returns ``None`` when *scan_val* is ``None`` (flat layout).
     """
-    if baseline is None:
+    if scan_val is None:
         return None
-    return str(baseline)
+    return str(scan_val)
 
 
-def _group_path(baseline, count):
+def _group_path(scan_val, count):
     """Return the internal HDF5 group path for a given entry."""
-    bkey = _baseline_key(baseline)
+    bkey = _scan_val_key(scan_val)
     if bkey is not None:
         return f"scan/{bkey}/{int(count)}"
     return str(int(count))
 
 
-def _eqdsk_dataset_name(header, baseline, count):
+def _eqdsk_dataset_name(header, scan_val, count):
     """Return the dataset name used for the raw eqdsk bytes."""
     base = os.path.basename(header)
-    bkey = _baseline_key(baseline)
+    bkey = _scan_val_key(scan_val)
     if bkey is not None:
         safe_key = bkey.replace("/", "_").replace(" ", "_")
         return f"{base}_{safe_key}_{int(count)}.eqdsk"
@@ -147,9 +147,12 @@ def store_equilibrium(
     w_ExB,
     li1,
     li3,
-    baseline=None,
+    scan_val=None,
     pressure=None,
     j_BS_edge=None,
+    pfile_bytes=None,
+    Zeff=None,
+    coil_currents=None,
 ):
     """
     Write one perturbed equilibrium into the HDF5 database.
@@ -170,14 +173,19 @@ def store_equilibrium(
         Internal inductance l_i(1).
     li3 : float
         Internal inductance l_i(3).
-    baseline : str, float, int, or None
+    scan_val : str, float, int, or None
         Scan-point label.  When provided, an extra ``scan/{label}/``
         group layer is inserted.  ``None`` gives the flat layout.
     pressure : array_like or None
-        1-D total pressure [Pa].  Optional for backward compatibility
-        with older workflows.
+        1-D total pressure [Pa].
     j_BS_edge : array_like or None
         1-D isolated edge bootstrap current [A m^-2].
+    pfile_bytes : bytes or None
+        Raw p-file content to store alongside the g-file bytes.
+    Zeff : array_like or None
+        1-D effective charge profile (dimensionless).
+    coil_currents : dict or None
+        Coil currents {name: current_A} from TokaMaker.
     """
     db_path = os.path.abspath(f"{header}.h5")
     if not os.path.isfile(db_path):
@@ -189,8 +197,8 @@ def store_equilibrium(
     with open(eqdsk_filepath, "rb") as fh:
         eqdsk_bytes = fh.read()
 
-    grp_path = _group_path(baseline, count)
-    ds_name  = _eqdsk_dataset_name(header, baseline, count)
+    grp_path = _group_path(scan_val, count)
+    ds_name  = _eqdsk_dataset_name(header, scan_val, count)
 
     with h5py.File(db_path, "a") as hf:
         # clean slate if this entry already exists
@@ -223,11 +231,28 @@ def store_equilibrium(
         grp.attrs["l_i(1)"] = float(li1)
         grp.attrs["l_i(3)"] = float(li3)
         grp.attrs["count"]  = int(count)
-        if baseline is not None:
-            grp.attrs["baseline"] = baseline
+        if scan_val is not None:
+            grp.attrs["scan_val"] = scan_val
+
+        # ---- optional: p-file bytes ----------------------------------------
+        if pfile_bytes is not None:
+            pf_ds = ds_name.replace(".eqdsk", ".pfile")
+            grp.create_dataset(pf_ds, data=np.void(pfile_bytes))
+
+        # ---- optional: Zeff profile ----------------------------------------
+        if Zeff is not None:
+            grp.create_dataset("Zeff", data=np.asarray(Zeff, dtype=np.float64))
+
+        # ---- optional: coil currents ---------------------------------------
+        if coil_currents is not None:
+            import json
+            names = list(coil_currents.keys())
+            values = np.array([coil_currents[n] for n in names], dtype=np.float64)
+            grp.create_dataset("coil_currents [A]", data=values)
+            grp.attrs["coil_names"] = json.dumps(names)
 
 
-def load_equilibrium(header, count, baseline=None, eqdsk_out_dir=None):
+def load_equilibrium(header, count, scan_val=None, eqdsk_out_dir=None):
     """
     Retrieve one equilibrium entry from the HDF5 database.
 
@@ -237,7 +262,7 @@ def load_equilibrium(header, count, baseline=None, eqdsk_out_dir=None):
         Base name of the database.
     count : int
         Perturbation index.
-    baseline : str, float, int, or None
+    scan_val : str, float, int, or None
         Scan-point label (must match what was used at write time).
     eqdsk_out_dir : str or None, optional
         If given, the raw eqdsk is written to a file in this directory.
@@ -247,11 +272,12 @@ def load_equilibrium(header, count, baseline=None, eqdsk_out_dir=None):
     result : dict
         Keys: ``"eqdsk_filepath"``, ``"eqdsk_bytes"``,
         the 1-D array names, ``"l_i(1)"``, ``"l_i(3)"``,
-        and optionally ``"pressure [Pa]"``.
+        and optionally ``"pressure [Pa]"``, ``"Zeff"``,
+        ``"coil_currents"``, ``"pfile_bytes"``.
     """
     db_path  = os.path.abspath(f"{header}.h5")
-    grp_path = _group_path(baseline, count)
-    ds_name  = _eqdsk_dataset_name(header, baseline, count)
+    grp_path = _group_path(scan_val, count)
+    ds_name  = _eqdsk_dataset_name(header, scan_val, count)
 
     result = {}
 
@@ -287,6 +313,22 @@ def load_equilibrium(header, count, baseline=None, eqdsk_out_dir=None):
         result["l_i(1)"] = float(grp.attrs["l_i(1)"])
         result["l_i(3)"] = float(grp.attrs["l_i(3)"])
 
+        # ---- optional: Zeff -----------------------------------------------
+        if "Zeff" in grp:
+            result["Zeff"] = np.array(grp["Zeff"])
+
+        # ---- optional: p-file bytes ----------------------------------------
+        pf_ds = ds_name.replace(".eqdsk", ".pfile")
+        if pf_ds in grp:
+            result["pfile_bytes"] = bytes(grp[pf_ds][()])
+
+        # ---- optional: coil currents ---------------------------------------
+        if "coil_currents [A]" in grp:
+            import json
+            values = np.array(grp["coil_currents [A]"])
+            names = json.loads(grp.attrs.get("coil_names", "[]"))
+            result["coil_currents"] = dict(zip(names, values))
+
     return result
 
 
@@ -309,12 +351,12 @@ def store_baseline_profiles(
     sigma_jphi,
     Ip_target,
     l_i_target,
-    baseline=None,
+    scan_val=None,
 ):
     """
     Store the input (baseline) profiles and their uncertainties.
 
-    For hierarchical layout (*baseline* is not ``None``), these are
+    For hierarchical layout (*scan_val* is not ``None``), these are
     stored in ``scan/{label}/_baseline/``.  For flat layout they go
     in ``_baseline/``.
 
@@ -322,7 +364,7 @@ def store_baseline_profiles(
     plotting GUI to be fully self-contained.
     """
     db_path = os.path.abspath(f"{header}.h5")
-    bkey = _baseline_key(baseline)
+    bkey = _scan_val_key(scan_val)
 
     if bkey is not None:
         grp_path = f"scan/{bkey}/_baseline"
@@ -398,7 +440,7 @@ def count_equilibria(h5path, scan_value=None):
     -------
     n : int
     """
-    bkey = _baseline_key(scan_value)
+    bkey = _scan_val_key(scan_value)
     with h5py.File(h5path, "r") as hf:
         if bkey is not None:
             parent = hf[f"scan/{bkey}"]
@@ -425,7 +467,7 @@ def load_baseline_profiles(h5path, scan_value=None):
     result : dict
         All stored baseline arrays and scalar attributes.
     """
-    bkey = _baseline_key(scan_value)
+    bkey = _scan_val_key(scan_value)
     if bkey is not None:
         grp_path = f"scan/{bkey}/_baseline"
     else:
@@ -456,7 +498,7 @@ def load_equilibrium_by_path(h5path, count, scan_value=None):
     **not** extract the raw eqdsk bytes (use :func:`load_equilibrium`
     if you need those).
     """
-    bkey = _baseline_key(scan_value)
+    bkey = _scan_val_key(scan_value)
     if bkey is not None:
         grp_path = f"scan/{bkey}/{int(count)}"
     else:
@@ -476,6 +518,15 @@ def load_equilibrium_by_path(h5path, count, scan_value=None):
 
         if "pressure [Pa]" in grp:
             result["pressure [Pa]"] = np.array(grp["pressure [Pa]"])
+
+        if "Zeff" in grp:
+            result["Zeff"] = np.array(grp["Zeff"])
+
+        if "coil_currents [A]" in grp:
+            import json
+            values = np.array(grp["coil_currents [A]"])
+            names = json.loads(grp.attrs.get("coil_names", "[]"))
+            result["coil_currents"] = dict(zip(names, values))
 
         result["l_i(1)"] = float(grp.attrs["l_i(1)"])
         result["l_i(3)"] = float(grp.attrs["l_i(3)"])

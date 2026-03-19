@@ -10,7 +10,7 @@ Provides:
   - ``generate_perturbed_GPR`` – convenience one-call wrapper.
   - ``verify_gpr_statistics`` – Monte-Carlo validation of GPR sampling.
   - ``calc_cylindrical_li_proxy`` – cylindrical :math:`l_i` proxy from
-    a 1-D :math:`j_\phi` profile.
+    a 1-D :math:`j_\\phi` profile.
 """
 
 import numpy as np
@@ -71,7 +71,7 @@ class GPRProfilePerturber:
     def __init__(
         self,
         kernel_func: str = "rbf",
-        length_scale: float = 0.1,
+        length_scale=0.1,
     ):
         if kernel_func not in self._ALLOWED_KERNELS:
             raise ValueError(
@@ -80,7 +80,11 @@ class GPRProfilePerturber:
                 "unsuitable for MHD inputs."
             )
         self.kernel_func = kernel_func
-        self.length_scale = float(length_scale)
+
+        # length_scale: scalar or 1-D array (non-stationary Gibbs kernel)
+        ls = np.asarray(length_scale, dtype=np.float64)
+        self._ls_is_array = ls.ndim >= 1 and ls.size > 1
+        self.length_scale = ls
 
         self._kernel = {
             "rbf": self._rbf_kernel,
@@ -88,16 +92,63 @@ class GPRProfilePerturber:
         }[self.kernel_func]
 
     # ---- unit-variance kernels --------------------------------------
+    def _ell_matrices(self, n1: int, n2: int):
+        r"""Build per-pair length-scale matrices for non-stationary kernels.
+
+        Returns ``(ell_i, ell_j)`` each of shape ``(n1, n2)`` such that
+        ``ell_i[a, b] = ell[a]`` and ``ell_j[a, b] = ell[b]``.
+        For a scalar length scale, returns ``(scalar, scalar)`` unchanged.
+        """
+        if not self._ls_is_array:
+            return self.length_scale, self.length_scale
+        ell = self.length_scale
+        return ell[:n1, None] * np.ones((1, n2)), np.ones((n1, 1)) * ell[:n2]
+
     def _rbf_kernel(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
-        r"""Squared-exponential kernel with unit variance."""
+        r"""Squared-exponential (Gibbs) kernel with unit variance.
+
+        For a scalar length scale this is the standard stationary RBF.
+        For a spatially-varying :math:`\ell(x)` it uses the Gibbs
+        non-stationary kernel:
+
+        .. math::
+
+            K(x_i, x_j) = \sqrt{\frac{2\,\ell_i\,\ell_j}
+                                      {\ell_i^2 + \ell_j^2}}
+                           \exp\!\Bigl(-\frac{d_{ij}^2}
+                                             {\ell_i^2 + \ell_j^2}\Bigr)
+
+        which preserves :math:`K(x, x) = 1`.
+        """
         d = cdist(X1.reshape(-1, 1), X2.reshape(-1, 1), "euclidean")
-        return np.exp(-0.5 * (d / self.length_scale) ** 2)
+        ell_i, ell_j = self._ell_matrices(len(X1), len(X2))
+
+        if not self._ls_is_array:
+            return np.exp(-0.5 * (d / ell_i) ** 2)
+
+        ell2_sum = ell_i**2 + ell_j**2
+        prefactor = np.sqrt(2.0 * ell_i * ell_j / ell2_sum)
+        return prefactor * np.exp(-d**2 / ell2_sum)
 
     def _matern52_kernel(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
-        r"""Matérn-5/2 kernel with unit variance."""
+        r"""Matérn-5/2 (Gibbs) kernel with unit variance.
+
+        Non-stationary extension: replaces the scalar :math:`\ell` with
+        the geometric mean :math:`\bar{\ell} = \sqrt{\ell_i \ell_j}` and
+        applies the same Gibbs prefactor as the RBF kernel.
+        """
         d = cdist(X1.reshape(-1, 1), X2.reshape(-1, 1), "euclidean")
-        s = np.sqrt(5.0) * d / self.length_scale
-        return (1.0 + s + s**2 / 3.0) * np.exp(-s)
+        ell_i, ell_j = self._ell_matrices(len(X1), len(X2))
+
+        if not self._ls_is_array:
+            s = np.sqrt(5.0) * d / ell_i
+            return (1.0 + s + s**2 / 3.0) * np.exp(-s)
+
+        ell2_sum = ell_i**2 + ell_j**2
+        prefactor = np.sqrt(2.0 * ell_i * ell_j / ell2_sum)
+        ell_geom = np.sqrt(ell_i * ell_j)
+        s = np.sqrt(5.0) * d / ell_geom
+        return prefactor * (1.0 + s + s**2 / 3.0) * np.exp(-s)
 
     # ---- core sampling method ----------------------------------------
     def generate_profiles(
@@ -156,13 +207,54 @@ class GPRProfilePerturber:
 
 
 # ====================================================================
+#  Spatially-varying length scale helpers
+# ====================================================================
+def sigmoid_length_scale(
+    psi_N: np.ndarray,
+    ls_core: float = 0.3,
+    ls_edge: float = 0.1,
+    psi_transition: float = 0.7,
+    steepness: float = 20.0,
+) -> np.ndarray:
+    r"""Build a sigmoid length-scale profile over normalised flux.
+
+    .. math::
+
+        \ell(\hat{\psi}) = \ell_{\rm core}
+            - \frac{\ell_{\rm core} - \ell_{\rm edge}}
+                   {1 + \exp\!\bigl[-k\,(\hat{\psi} - \hat{\psi}_t)\bigr]}
+
+    Parameters
+    ----------
+    psi_N : ndarray
+        1-D normalised flux grid.
+    ls_core : float
+        Correlation length in the core (:math:`\hat{\psi} \ll \hat{\psi}_t`).
+    ls_edge : float
+        Correlation length at the edge (:math:`\hat{\psi} \gg \hat{\psi}_t`).
+    psi_transition : float
+        Centre of the sigmoid transition.
+    steepness : float
+        Steepness *k* of the sigmoid (larger = sharper transition).
+
+    Returns
+    -------
+    ndarray
+        1-D array of length scales, same shape as ``psi_N``.
+    """
+    return ls_core - (ls_core - ls_edge) / (
+        1.0 + np.exp(-steepness * (psi_N - psi_transition))
+    )
+
+
+# ====================================================================
 #  Convenience wrapper
 # ====================================================================
 def generate_perturbed_GPR(
     xdata: np.ndarray,
     profile: np.ndarray,
     sigma_profile: Optional[np.ndarray] = None,
-    length_scale: float = 0.25,
+    length_scale=0.25,
     n_samples: int = 1,
     kernel_func: str = "rbf",
     rng: Optional[np.random.Generator] = None,
@@ -184,8 +276,11 @@ def generate_perturbed_GPR(
     sigma_profile : ndarray or None
         1-D experimental :math:`1\sigma` uncertainty **in profile
         units**.  ``None`` gives zero (no perturbation).
-    length_scale : float
-        GPR correlation length (controls wiggliness).
+    length_scale : float or ndarray
+        GPR correlation length (controls wiggliness).  A scalar gives
+        a stationary kernel; a 1-D array (same length as *xdata*)
+        gives a non-stationary Gibbs kernel with spatially-varying
+        correlation length.  See :func:`sigmoid_length_scale`.
     n_samples : int
         Number of independent draws.
     kernel_func : str
@@ -493,6 +588,80 @@ def calc_cylindrical_li_proxy(mygs, j_phi_profile, psi_pad):
 
     return li_proxy
 
+
+def get_li_proxy_geometry(mygs, n_psi, psi_pad):
+    """Pre-compute geometry arrays for :func:`calc_cylindrical_li_proxy_fast`.
+
+    Call this **once** before a loop of proxy evaluations where the
+    equilibrium state does not change between iterations (i.e.\\ no
+    ``mygs.solve()`` calls in between).  The returned dict should be
+    passed to :func:`calc_cylindrical_li_proxy_fast`.
+
+    Returns
+    -------
+    geo : dict
+        Geometry cache with keys ``psi_N``, ``R_avg``, ``dV``,
+        ``V_enc``, ``V_tot``, ``r_eff``, ``dA``.
+    """
+    psi_N, f, fp, p, pp = mygs.get_profiles(npsi=n_psi, psi_pad=psi_pad)
+    _, qvals, ravgs_q, dl, rbounds, zbounds = mygs.get_q(npsi=n_psi, psi_pad=psi_pad)
+    psi_range = mygs.psi_bounds[1] - mygs.psi_bounds[0]
+
+    R_avg = ravgs_q[0]
+    dV_dPsi = ravgs_q[2]
+    grad_psi_N = np.gradient(psi_N)
+    d_psi_real = grad_psi_N * psi_range
+    dV = dV_dPsi * d_psi_real
+    V_enc = integrate.cumulative_trapezoid(dV, initial=0)
+    V_tot = V_enc[-1]
+    r_eff = np.sqrt(np.abs(V_enc) / (2 * np.pi**2 * R_avg))
+    dA = dV / (2 * np.pi * R_avg)
+
+    return {
+        "psi_N": psi_N, "R_avg": R_avg, "dV": dV,
+        "V_enc": V_enc, "V_tot": V_tot, "r_eff": r_eff, "dA": dA,
+    }
+
+
+def calc_cylindrical_li_proxy_fast(j_phi_profile, geo):
+    """Same calculation as :func:`calc_cylindrical_li_proxy` but using
+    pre-computed geometry (no TokaMaker calls).
+
+    Parameters
+    ----------
+    j_phi_profile : array-like
+        Toroidal current density profile.
+    geo : dict
+        From :func:`get_li_proxy_geometry`.
+
+    Returns
+    -------
+    li_proxy : float
+    """
+    dA = geo["dA"]
+    r_eff = geo["r_eff"]
+    dV = geo["dV"]
+    V_tot = geo["V_tot"]
+
+    dI = j_phi_profile * dA
+    I_enc = integrate.cumulative_trapezoid(dI, initial=0)
+    I_tot = I_enc[-1]
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        B_p_proxy = I_enc / (2 * np.pi * r_eff)
+    B_p_proxy[0] = 0.0
+
+    B_p_sq = B_p_proxy**2
+    W_pol_integral = integrate.trapezoid(B_p_sq * dV)
+    L_edge = 2 * np.pi * r_eff[-1]
+
+    if I_tot == 0:
+        return 0.0
+
+    B_p_edge_avg = I_tot / L_edge
+    return W_pol_integral / (V_tot * B_p_edge_avg**2)
+
+
 # ====================================================================
 #  Helper: draw a monotonically-decreasing GPR perturbation
 # ====================================================================
@@ -515,8 +684,8 @@ def _draw_monotonic_perturbation(
     sigma_profile : ndarray
         :math:`1\sigma` uncertainty in normalised-profile units
         (same grid).
-    length_scale : float
-        GPR correlation length.
+    length_scale : float or ndarray
+        GPR correlation length (scalar or spatially-varying).
     max_draws : int
         Safety cap on the number of attempts.
 

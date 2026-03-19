@@ -27,6 +27,8 @@ import matplotlib.pyplot as plt
 from .sampling import (
     generate_perturbed_GPR,
     calc_cylindrical_li_proxy,
+    get_li_proxy_geometry,
+    calc_cylindrical_li_proxy_fast,
     _draw_monotonic_perturbation,
     EC,
     _MAX_PRESSURE_ITER,
@@ -199,7 +201,7 @@ def perturb_kinetic_equilibrium(
     p_thresh=0.5,
     input_jinductive=None,
     l_i_tolerance=0.05,
-    l_i_proxy_threshold=2.0,
+    l_i_proxy_threshold=5.0,
     psi_pad=1e-3,
     constrain_sawteeth=True,
     recalculate_j_BS=True,
@@ -245,8 +247,9 @@ def perturb_kinetic_equilibrium(
         GPR length-scale for density profiles.
     t_ls : float
         GPR length-scale for temperature profiles.
-    j_ls : float
-        GPR length-scale for :math:`j_\phi`.
+    j_ls : float or ndarray
+        GPR length-scale for :math:`j_\phi`.  A 1-D array gives a
+        non-stationary Gibbs kernel (see ``sigmoid_length_scale``).
     Ip_target : float
         Target plasma current [A].
     l_i_target : float
@@ -391,13 +394,17 @@ def perturb_kinetic_equilibrium(
     iteration_Ips = []
 
     if recalculate_j_BS:
+        # Always suppress solve_with_bootstrap's internal j_phi iteration
+        # plots; the useful diagnostic is the "jphi-linterp | l_i iter"
+        # figure produced later in the l_i loop.
         results = solve_with_bootstrap(
             mygs,
             ne_perturb, te_perturb, ni_perturb, ti_perturb,
             Zeff, Ip_target, input_jinductive,
             scale_jBS=scale_jBS,
             isolate_edge_jBS=isolate_edge_jBS,
-            diagnostic_plots=diagnostic_plots,
+            diagnostic_plots=False,
+            verbose=False,
         )
         eq_stats = mygs.get_stats(lcfs_pad=psi_pad)
 
@@ -426,9 +433,19 @@ def perturb_kinetic_equilibrium(
         results["j_inductive"] if recalculate_j_BS else input_j_phi.copy()
     )
 
+    # The proxy target starts at the baseline proxy value but is
+    # adaptively corrected after each TokaMaker solve to account for
+    # the systematic offset between the cylindrical proxy and the
+    # actual equilibrium l_i.  This makes the proxy filter select
+    # profiles that land near l_i_target in equilibrium space rather
+    # than in proxy space.
+    proxy_target = baseline_li_proxy
+
     for li_iter in range(1, max_li_iter + 1):
         if abs(l_i - l_i_target) <= l_i_tolerance:
             break
+
+        t_phase = time.perf_counter()
 
         # ---- 5a. Draw j_phi perturbation matching l_i proxy --------
         step_j_phi = (
@@ -436,8 +453,14 @@ def perturb_kinetic_equilibrium(
         )
         j_phi_0 = step_j_phi[0]
 
+        # Pre-compute geometry once for the inner proxy loop (the
+        # equilibrium state doesn't change between proxy evaluations).
+        _geo = get_li_proxy_geometry(mygs, npsi, psi_pad)
+
         l_i_rel_err = np.inf
+        proxy_draws = 0
         while l_i_rel_err > l_i_proxy_threshold:
+            proxy_draws += 1
             jphi_perturb = generate_perturbed_GPR(
                 psi_N,
                 step_j_phi / j_phi_0,
@@ -461,11 +484,17 @@ def perturb_kinetic_equilibrium(
             a_optimal = result_root.root
             matched_jphi_perturb = a_optimal * jphi_perturb + spike_profile
 
-            tmp_li_proxy = calc_cylindrical_li_proxy(mygs, matched_jphi_perturb, psi_pad)
-            l_i_rel_err = (
-                100.0 * abs(tmp_li_proxy - baseline_li_proxy) / baseline_li_proxy
+            # Fast proxy: uses cached geometry, no TokaMaker calls
+            tmp_li_proxy = calc_cylindrical_li_proxy_fast(
+                matched_jphi_perturb, _geo
             )
-        print("Found potential l_i match via proxy!\n")
+            l_i_rel_err = (
+                100.0 * abs(tmp_li_proxy - proxy_target) / proxy_target
+            )
+
+        dt_proxy = time.perf_counter() - t_phase
+        print(f"  [li_iter={li_iter}] Proxy matched in {proxy_draws} draws "
+              f"({dt_proxy:.1f}s, err={l_i_rel_err:.3f}%)")
 
         # ---- 5b. Set up GS profiles --------------------------------
         psi_range = mygs.psi_bounds[1] - mygs.psi_bounds[0]
@@ -482,24 +511,37 @@ def perturb_kinetic_equilibrium(
         matched_j_inductive = a_optimal * jphi_perturb
 
         # ---- 5c. Find optimal scale factors -------------------------
-        print(f"\n >>> Finding optimal j_phi scale factor")
+        t_scale = time.perf_counter()
         final_scale_j0, final_jphi = find_optimal_scale(
             mygs, psi_N, pres_tmp, ffp_prof, pp_prof,
             matched_j_inductive, Ip_target, psi_pad,
             spike_prof=spike_profile, find_j0=True,
-            diagnostic_plots=diagnostic_plots,
+            diagnostic_plots=False, verbose=False,
         )
 
-        print(f"\n >>> Finding optimal Ip scale factor")
+        # Preliminary q_0 check: the j_phi scale solve has already
+        # converged, so we can reject before the more expensive Ip
+        # scale solve.  A definitive check follows after Ip scaling.
+        if constrain_sawteeth:
+            _, q_pre, _, _, _, _ = mygs.get_q(npsi=npsi, psi_pad=psi_pad)
+            if q_pre[0] < 1.0:
+                dt_scale = time.perf_counter() - t_scale
+                print(f"  [li_iter={li_iter}] find_optimal_scale: {dt_scale:.1f}s")
+                print("Skipping this equilibrium, q_0 < 1.0 (pre-check)")
+                l_i = np.inf
+                continue
+
         final_scale_Ip, _ = find_optimal_scale(
             mygs, psi_N, pres_tmp, ffp_prof, pp_prof,
             matched_j_inductive, Ip_target, psi_pad,
             spike_prof=spike_profile, find_j0=False,
             scale_j0=final_scale_j0, tolerance=0.001,
-            diagnostic_plots=diagnostic_plots,
+            diagnostic_plots=False, verbose=False,
         )
+        dt_scale = time.perf_counter() - t_scale
+        print(f"  [li_iter={li_iter}] find_optimal_scale: {dt_scale:.1f}s")
 
-        # ---- 5d. Optional sawtooth constraint -----------------------
+        # ---- 5d. Definitive sawtooth constraint (after Ip scaling) --
         if constrain_sawteeth:
             _, q, _, _, _, _ = mygs.get_q(npsi=npsi, psi_pad=psi_pad)
             if q[0] < 1.0:
@@ -538,7 +580,7 @@ def perturb_kinetic_equilibrium(
         if diagnostic_plots:
             fig, ax = plt.subplots(figsize=(5, 4))
             ax.plot(psi_N, matched_jphi_perturb, label=r"Input $j_\phi$")
-            ax.plot(psi_N, output_jphi, label=r"Output $j_\phi$")
+            ax.plot(psi_N, output_jphi, label=r"Converged $j_\phi$")
             ax.fill_between(
                 psi_N,
                 input_j_phi - sigma_jphi,
@@ -549,12 +591,6 @@ def perturb_kinetic_equilibrium(
                 0.0,
                 max(input_j_phi[0], (input_j_phi + sigma_jphi)[0]),
             )
-
-            ax2 = ax.twinx()
-            ax2.set_ylabel(r"$\sigma_{\rm exp}$ [A/m$^2$]", color="red")
-            ax2.plot(psi_N, sigma_jphi, color="red", ls="--", alpha=0.5)
-            ax2.tick_params(axis="y", labelcolor="red")
-            ax2.set_ylim(0.0, None)
 
             ax.legend(loc="best")
             ax.set_xlabel(r"$\hat{\psi}$")
@@ -567,19 +603,40 @@ def perturb_kinetic_equilibrium(
         Ip = eq_stats["Ip"]
         l_i = eq_stats["l_i"]
 
+        # Compute cylindrical proxy on the FINAL converged j_phi to
+        # measure the proxy-vs-TokaMaker offset.  This diagnostic
+        # helps calibrate the l_i_proxy_threshold parameter.
+        final_li_proxy = calc_cylindrical_li_proxy_fast(output_jphi, _geo)
+        proxy_vs_real = 100.0 * (final_li_proxy - l_i) / l_i if l_i != 0 else 0.0
+
         Ip_err = 100.0 * abs(Ip - Ip_target) / Ip_target
-        print(f"  matched l_i:          {l_i:.4f}")
+
+        # Adaptive proxy target correction: use the observed
+        # proxy-to-equilibrium mapping to predict what proxy value
+        # would produce l_i_target in the actual equilibrium.
+        if l_i > 0 and np.isfinite(l_i):
+            corrected_target = final_li_proxy * (l_i_target / l_i)
+            # Blend: 70% new correction, 30% old target (smooths noise)
+            proxy_target = 0.7 * corrected_target + 0.3 * proxy_target
+
+        print(f"  l_i target (equil):   {l_i_target:.4f}")
+        print(f"  proxy target:         {proxy_target:.4f}  (corrected)")
+        print(f"  matched l_i (equil):  {l_i:.4f}")
+        print(f"  matched l_i (proxy):  {final_li_proxy:.4f}")
         print(f"  Ip error vs target:   {Ip_err:.3f}%")
-        print(f"  l_i proxy rel. err:   {l_i_rel_err:.3f}%")
+        print(f"  proxy vs real l_i:    {proxy_vs_real:+.2f}%")
         print(f"  |l_i - l_i_target|:   {abs(l_i - l_i_target):.4f}")
 
         iteration_l_is.append(l_i)
         iteration_Ips.append(Ip)
     else:
         # Fired only if the for-loop exhausted without break
-        print(
-            f"WARNING: l_i match not achieved in {max_li_iter} iterations "
-            f"(last |l_i - target| = {abs(l_i - l_i_target):.4f})"
+        raise RuntimeError(
+            f"l_i match not found after {max_li_iter} iterations "
+            f"(last |l_i - target| = {abs(l_i - l_i_target):.4f}, "
+            f"target={l_i_target:.4f}, best={l_i:.4f}).\n"
+            f"Try reducing your kinetic profile uncertainties or "
+            f"increasing l_i_tolerance."
         )
 
     # ----------------------------------------------------------------
@@ -614,7 +671,7 @@ def perturb_kinetic_equilibrium(
 # ====================================================================
 #  Top-level scan driver
 # ====================================================================
-def generate_perturbed_equilibria(
+def generate_bouquet(
     mygs,
     psi_N,
     n_equils,
@@ -637,14 +694,16 @@ def generate_perturbed_equilibria(
     Zeff,
     input_jinductive=None,
     l_i_tolerance=0.03,
-    l_i_proxy_threshold=1.0,
+    l_i_proxy_threshold=5.0,
     psi_pad=1e-3,
     constrain_sawteeth=True,
     recalculate_j_BS=True,
     isolate_edge_jBS=True,
     jBS_scale_range=None,
     diagnostic_plots=True,
-    baseline=None,
+    scan_val=None,
+    pfile_bytes=None,
+    Zeff_profile=None,
 ):
     r"""Generate a batch of perturbed equilibria and archive to HDF5.
 
@@ -682,8 +741,9 @@ def generate_perturbed_equilibria(
         GPR length-scale for density profiles.
     t_ls : float
         GPR length-scale for temperature profiles.
-    j_ls : float
-        GPR length-scale for :math:`j_\phi`.
+    j_ls : float or ndarray
+        GPR length-scale for :math:`j_\phi`.  A 1-D array gives a
+        non-stationary Gibbs kernel (see ``sigmoid_length_scale``).
     initial_Ip_target : float
         Target plasma current [A].
     l_i_target : float
@@ -706,18 +766,20 @@ def generate_perturbed_equilibria(
         Separate the edge bootstrap-current spike from the core
         contribution inside ``solve_with_bootstrap``.
     jBS_scale_range : list of two floats, or None
-        :math:`\pm 1\sigma` bounds for a normally distributed
-        multiplicative scale factor applied to :math:`j_{\rm BS}`.
-        For example, ``[0.9, 1.1]`` draws from
-        :math:`\mathcal{N}(\mu{=}1.0,\, \sigma{=}0.1)` each
-        iteration, centred on 1.0 with a half-width of 0.1.
+        Bounds ``[lo, hi]`` for a uniformly distributed multiplicative
+        scale factor applied to :math:`j_{\rm BS}`.  For example,
+        ``[0.8, 1.2]`` draws from :math:`\mathcal{U}(0.8, 1.2)`.
         When ``None``, no additional scaling is applied
         (``scale_jBS = 1.0`` for every sample).
     diagnostic_plots : bool
         Show diagnostic matplotlib figures.
-    baseline : str, float, int, or None
+    scan_val : str, float, int, or None
         Optional scan-point label for nested HDF5 storage.
         ``None`` gives the flat layout.
+    pfile_bytes : bytes or None
+        Raw p-file content to store alongside each equilibrium.
+    Zeff_profile : array-like or None
+        1-D effective charge profile to store in HDF5.
 
     Returns
     -------
@@ -731,11 +793,12 @@ def generate_perturbed_equilibria(
     npsi = len(pressure)
 
     # Pre-compute jBS scale factors for the whole batch (if requested).
+    # Uses a uniform distribution within the specified range so that
+    # extreme values (which can make l_i matching very difficult) are
+    # strictly bounded.
     if jBS_scale_range is not None:
         lo, hi = jBS_scale_range
-        jBS_mu = 0.5 * (lo + hi)
-        jBS_sigma = 0.5 * (hi - lo)
-        jBS_scales = np.random.normal(jBS_mu, jBS_sigma, size=n_equils)
+        jBS_scales = np.random.uniform(lo, hi, size=n_equils)
     else:
         jBS_scales = np.ones(n_equils)
 
@@ -747,51 +810,92 @@ def generate_perturbed_equilibria(
         pressure, input_j_phi,
         sigma_ne, sigma_te, sigma_ni, sigma_ti, sigma_jphi,
         initial_Ip_target, l_i_target,
-        baseline=baseline,
+        scan_val=scan_val,
     )
 
-    for count in range(n_equils):
+    t_batch_start = time.perf_counter()
+    elapsed_times = []
+
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:
+        _tqdm = None
+
+    pbar = (
+        _tqdm(range(n_equils), desc="Bouquet", unit="eq")
+        if _tqdm is not None
+        else None
+    )
+    eq_iter = pbar if pbar is not None else range(n_equils)
+
+    for count in eq_iter:
         scale_jBS = float(jBS_scales[count])
-        print(f"Perturber count: {count}  (scale_jBS={scale_jBS:.4f})")
+        eta_str = ""
+        if elapsed_times:
+            avg_s = np.mean(elapsed_times)
+            remaining = avg_s * (n_equils - count)
+            eta_min = remaining / 60.0
+            eta_str = f"  ETA: {eta_min:.1f} min"
+        print(f"\n{'='*60}")
+        print(f"  Equilibrium {count+1}/{n_equils}  "
+              f"(scale_jBS={scale_jBS:.4f}){eta_str}")
+        print(f"{'='*60}")
         t_start = time.perf_counter()
 
-        (
-            ne_perturb,
-            te_perturb,
-            ni_perturb,
-            ti_perturb,
-            w_ExB,
-            jphi_perturb,
-            diagnostics,
-        ) = perturb_kinetic_equilibrium(
-            mygs,
-            psi_N,
-            pressure,
-            ne, te, ni, ti,
-            input_j_phi,
-            sigma_ne,
-            sigma_te,
-            sigma_ni,
-            sigma_ti,
-            sigma_jphi,
-            n_ls, t_ls, j_ls,
-            initial_Ip_target,
-            l_i_target,
-            Zeff,
-            npsi,
-            input_jinductive=input_jinductive,
-            l_i_tolerance=l_i_tolerance,
-            l_i_proxy_threshold=l_i_proxy_threshold,
-            psi_pad=psi_pad,
-            constrain_sawteeth=constrain_sawteeth,
-            recalculate_j_BS=recalculate_j_BS,
-            isolate_edge_jBS=isolate_edge_jBS,
-            scale_jBS=scale_jBS,
-            diagnostic_plots=diagnostic_plots,
-        )
+        try:
+            (
+                ne_perturb,
+                te_perturb,
+                ni_perturb,
+                ti_perturb,
+                w_ExB,
+                jphi_perturb,
+                diagnostics,
+            ) = perturb_kinetic_equilibrium(
+                mygs,
+                psi_N,
+                pressure,
+                ne, te, ni, ti,
+                input_j_phi,
+                sigma_ne,
+                sigma_te,
+                sigma_ni,
+                sigma_ti,
+                sigma_jphi,
+                n_ls, t_ls, j_ls,
+                initial_Ip_target,
+                l_i_target,
+                Zeff,
+                npsi,
+                input_jinductive=input_jinductive,
+                l_i_tolerance=l_i_tolerance,
+                l_i_proxy_threshold=l_i_proxy_threshold,
+                psi_pad=psi_pad,
+                constrain_sawteeth=constrain_sawteeth,
+                recalculate_j_BS=recalculate_j_BS,
+                isolate_edge_jBS=isolate_edge_jBS,
+                scale_jBS=scale_jBS,
+                diagnostic_plots=diagnostic_plots,
+            )
+        except RuntimeError as e:
+            print(f"\n  STOPPED: {e}")
+            print(f"  Skipping equilibrium {count+1}/{n_equils}.\n")
+            if pbar is not None:
+                pbar.update(1)
+            continue
 
         elapsed = time.perf_counter() - t_start
-        print(f"  Wall-clock time: {elapsed:.1f} s")
+        elapsed_times.append(elapsed)
+        total_elapsed = time.perf_counter() - t_batch_start
+        print(f"  Wall-clock time: {elapsed:.1f}s  "
+              f"(total: {total_elapsed/60:.1f} min, "
+              f"avg: {np.mean(elapsed_times):.1f}s/eq)")
+
+        if pbar is not None:
+            pbar.set_postfix_str(
+                f"avg={np.mean(elapsed_times):.0f}s/eq, "
+                f"total={total_elapsed/60:.1f}min"
+            )
 
         diagnostics['time'] = elapsed
 
@@ -815,6 +919,9 @@ def generate_perturbed_equilibria(
         pressure_perturb = EC * (ne_perturb * te_perturb
                                   + ni_perturb * ti_perturb)
 
+        # Extract coil currents from TokaMaker
+        coil_current_dict, _ = mygs.get_coil_currents()
+
         store_equilibrium(
             header, count, full_path,
             psi_N,
@@ -825,9 +932,12 @@ def generate_perturbed_equilibria(
             ni_perturb, ti_perturb,
             w_ExB,
             li1, li3,
-            baseline=baseline,
+            scan_val=scan_val,
             pressure=pressure_perturb,
             j_BS_edge=diagnostics["j_BS_edge"],
+            pfile_bytes=pfile_bytes,
+            Zeff=Zeff_profile,
+            coil_currents=coil_current_dict,
         )
 
         # Clean up on-disk eqdsk after archiving
@@ -838,6 +948,9 @@ def generate_perturbed_equilibria(
             print(f"  WARNING: could not delete {full_path}: {exc}")
 
         all_diagnostics.append(diagnostics)
+
+    if pbar is not None:
+        pbar.close()
 
     return all_diagnostics
 

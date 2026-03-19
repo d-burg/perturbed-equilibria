@@ -312,6 +312,102 @@ def _select_main_contour(segments, R0, Z0, sigma_RpZ, sigma_rhotp):
     return best
 
 
+def _crop_at_xpoint(seg, R0, Z0):
+    """Crop an open separatrix contour at the X-point to produce a closed LCFS.
+
+    For a lower single null (or upper), contourpy returns an open contour
+    that goes through the X-point and into the divertor legs.  This
+    function finds the two points where the contour is closest to the
+    X-point (one per pass) and keeps only the segment between them that
+    encircles the magnetic axis.
+
+    Parameters
+    ----------
+    seg : ndarray (N, 2)
+        Open contour segment with columns (R, Z).
+    R0, Z0 : float
+        Magnetic axis position.
+
+    Returns
+    -------
+    ndarray (M, 2)
+        Closed contour (first point == last point).
+    """
+    r, z = seg[:, 0], seg[:, 1]
+    n = len(r)
+
+    # Check if already closed
+    gap = np.sqrt((r[0] - r[-1])**2 + (z[0] - z[-1])**2)
+    perimeter = np.sum(np.sqrt(np.diff(r)**2 + np.diff(z)**2))
+    if gap < 0.01 * perimeter:
+        out = seg.copy()
+        out[-1] = out[0]
+        return out
+
+    # Approximate X-point from the gap midpoint
+    r_xpt = 0.5 * (r[0] + r[-1])
+    z_xpt = 0.5 * (z[0] + z[-1])
+
+    # Distance of every contour point from the X-point
+    dist = np.sqrt((r - r_xpt)**2 + (z - z_xpt)**2)
+
+    # Find local minima in the distance profile (passes near X-point).
+    # Smooth slightly to avoid noise.
+    from scipy.ndimage import uniform_filter1d
+    dist_smooth = uniform_filter1d(dist, size=max(5, n // 50))
+
+    # Find all local minima
+    local_min = np.zeros(n, dtype=bool)
+    for i in range(1, n - 1):
+        if dist_smooth[i] < dist_smooth[i-1] and dist_smooth[i] < dist_smooth[i+1]:
+            local_min[i] = True
+
+    min_indices = np.where(local_min)[0]
+
+    if len(min_indices) < 2:
+        # Can't find two X-point passes — just close it
+        out = seg.copy()
+        out[-1] = out[0]
+        return out
+
+    # Sort minima by distance and take the two closest to the X-point
+    sorted_by_dist = min_indices[np.argsort(dist[min_indices])]
+
+    # We need two minima that are well separated (not adjacent)
+    idx1 = sorted_by_dist[0]
+    idx2 = None
+    for candidate in sorted_by_dist[1:]:
+        separation = abs(candidate - idx1)
+        if separation > n // 10:  # at least 10% of contour apart
+            idx2 = candidate
+            break
+
+    if idx2 is None:
+        out = seg.copy()
+        out[-1] = out[0]
+        return out
+
+    # Ensure idx1 < idx2
+    if idx1 > idx2:
+        idx1, idx2 = idx2, idx1
+
+    # The plasma-encircling portion is between idx1 and idx2
+    plasma_seg = seg[idx1:idx2+1]
+
+    # Verify it encircles the axis
+    theta = np.unwrap(np.arctan2(plasma_seg[:, 1] - Z0,
+                                  plasma_seg[:, 0] - R0))
+    winding = abs(theta[-1] - theta[0])
+
+    if winding < np.pi:
+        # Wrong half — use the complement
+        plasma_seg = np.vstack([seg[idx2:], seg[:idx1+1]])
+
+    # Close the contour
+    closed = np.vstack([plasma_seg, plasma_seg[:1]])
+    return closed
+
+
 # ---------------------------------------------------------------------------
 # Section 4: Flux-surface geometry helper
 # ---------------------------------------------------------------------------
@@ -331,16 +427,46 @@ def _flux_geometry(R, Z):
     """
     geo = {}
 
-    max_r, min_r = np.max(R), np.min(R)
-    max_z, min_z = np.max(Z), np.min(Z)
+    # --- Parabolic sub-grid extremum finder (matches OMFIT's
+    # ``parabolaMaxCycle`` in utils_math.py) ---------------------------
+    def _parabola_extremum(idx, main, other):
+        """Parabolic fit through 3 points around *idx* on a closed curve.
 
+        Returns ``(other_at_extremum, main_at_extremum)`` — the
+        coordinates of the refined extremum in both arrays.
+        """
+        n = len(main)
+        if n < 3:
+            return other[idx], main[idx]
+
+        # Cyclic neighbour indices (closed contour: first == last)
+        im = (idx - 1) % (n - 1) if main[0] == main[-1] else max(idx - 1, 0)
+        ip = (idx + 1) % (n - 1) if main[0] == main[-1] else min(idx + 1, n - 1)
+
+        ym1, y0, yp1 = main[im], main[idx], main[ip]
+        xm1, x0, xp1 = other[im], other[idx], other[ip]
+
+        denom = 2.0 * (ym1 - 2.0 * y0 + yp1)
+        if abs(denom) < 1e-30:
+            return x0, y0
+        frac = (ym1 - yp1) / denom  # fractional index offset
+        frac = np.clip(frac, -0.5, 0.5)
+        x_ext = x0 + frac * 0.5 * (xp1 - xm1)
+        y_ext = y0 + frac * 0.5 * (yp1 - ym1)
+        return x_ext, y_ext
+
+    # Four principal extrema via parabolic refinement
     imaxr = np.argmax(R)
-    z_at_max_r = Z[imaxr]
+    z_at_max_r, max_r = _parabola_extremum(imaxr, R, Z)
+
+    iminr = np.argmin(R)
+    z_at_min_r, min_r = _parabola_extremum(iminr, R, Z)
 
     imaxz = np.argmax(Z)
-    r_at_max_z = R[imaxz]
+    r_at_max_z, max_z = _parabola_extremum(imaxz, Z, R)
+
     iminz = np.argmin(Z)
-    r_at_min_z = R[iminz]
+    r_at_min_z, min_z = _parabola_extremum(iminz, Z, R)
 
     # Closed-contour arc-length: include the closing segment.
     dR = np.diff(R, append=R[0])
@@ -755,8 +881,24 @@ class GEQDSKEquilibrium:
 
     @property
     def rhovn(self):
-        """Normalised toroidal flux coordinate sqrt(phi/phi_edge)."""
-        return self._raw.get("RHOVN", np.sqrt(np.linspace(0, 1, int(self._raw["NW"]))))
+        r"""Normalised toroidal flux coordinate
+        :math:`\rho = \sqrt{\Phi_{\rm tor}/\Phi_{\rm tor,edge}}`.
+
+        Always computed from the safety factor profile:
+        :math:`\Phi(\psi) = \int_{\psi_{\rm axis}}^{\psi} q\,d\psi'`.
+
+        Many equilibrium solvers (including TokaMaker) write a
+        placeholder ``RHOVN = sqrt(psi_N)`` to the g-file, which is
+        only correct when q is constant.  This property ignores any
+        stored ``RHOVN`` and recomputes from ``QPSI`` for accuracy.
+        """
+        NW = int(self._raw["NW"])
+        psi_grid = np.linspace(self.psi_axis, self.psi_boundary, NW)
+        phi = integrate.cumulative_trapezoid(self._raw["QPSI"], psi_grid, initial=0)
+        phi_edge = phi[-1]
+        if abs(phi_edge) < 1e-30:
+            return np.sqrt(np.linspace(0, 1, NW))
+        return np.sqrt(np.abs(phi / phi_edge))
 
     # --- Lazy field computation ---
 
@@ -872,6 +1014,8 @@ class GEQDSKEquilibrium:
                 contours[nc - 1], R0, Z0,
                 cc["sigma_RpZ"], cc["sigma_rhotp"],
             )
+            if sep_seg is not None and len(sep_seg) >= 10:
+                sep_seg = _crop_at_xpoint(sep_seg, R0, Z0)
             if sep_seg is not None and len(sep_seg) >= 6:
                 theta_xpt = _detect_xpoint_angle(
                     sep_seg[:, 0], sep_seg[:, 1], R0, Z0
@@ -893,21 +1037,26 @@ class GEQDSKEquilibrium:
             avg["FFPRIM"][k] = ffprim_k
 
             if pn == 0:
-                # Magnetic axis: degenerate point
+                # Magnetic axis: create a tiny elliptical contour
+                # following OMFIT's approach (fluxSurface.py lines
+                # 731-757).  The axis is a degenerate point, but a
+                # tiny contour around it allows the averaging loop to
+                # process it consistently.  The shape (kappa) is
+                # borrowed from the first interior surface (k=1) once
+                # that surface has been processed.  For now, store
+                # placeholder values; the axis will be revisited
+                # AFTER the main loop using k=1's geometry.
                 contour_data.append(np.array([[R0, Z0]]))
                 avg["R"][k] = R0
                 avg["1/R"][k] = 1.0 / R0
                 avg["1/R**2"][k] = 1.0 / R0**2
                 avg["R**2"][k] = R0**2
                 Bt_axis = F_k / R0
-                Br0 = float(Br_interp.ev(Z0, R0))
-                Bz0 = float(Bz_interp.ev(Z0, R0))
-                Bp0_sq = Br0**2 + Bz0**2
                 avg["Bp"][k] = 0.0
-                avg["Bp**2"][k] = Bp0_sq
+                avg["Bp**2"][k] = 0.0
                 avg["Bt"][k] = Bt_axis
                 avg["Bt**2"][k] = Bt_axis**2
-                avg["Btot**2"][k] = Bp0_sq + Bt_axis**2
+                avg["Btot**2"][k] = Bt_axis**2
                 Jt0 = float(Jt_interp.ev(Z0, R0))
                 avg["Jt"][k] = Jt0
                 avg["Jt/R"][k] = Jt0 / R0
@@ -917,16 +1066,24 @@ class GEQDSKEquilibrium:
                     geo_arrays[gk][k] = 0.0
                 geo_arrays["R"][k] = R0
                 geo_arrays["Z"][k] = Z0
-                geo_arrays["kappa"][k] = 1.0
-                geo_arrays["kapu"][k] = 1.0
-                geo_arrays["kapl"][k] = 1.0
                 continue
 
-            # Select main contour
-            seg = _select_main_contour(
-                contours[k], R0, Z0,
-                cc["sigma_RpZ"], cc["sigma_rhotp"],
-            )
+            # Select main contour.  At the separatrix (psi_N == 1),
+            # contourpy often returns an open contour that includes
+            # divertor legs.  Use the g-file's stored LCFS boundary
+            # instead — it is already properly closed.
+            if pn == 1.0 and len(self.boundary_R) >= 4:
+                seg = np.column_stack([self.boundary_R, self.boundary_Z])
+                # Ensure closure
+                if np.sqrt((seg[0,0]-seg[-1,0])**2 + (seg[0,1]-seg[-1,1])**2) > 1e-6:
+                    seg = np.vstack([seg, seg[:1]])
+            else:
+                seg = _select_main_contour(
+                    contours[k], R0, Z0,
+                    cc["sigma_RpZ"], cc["sigma_rhotp"],
+                )
+                if seg is not None and len(seg) >= 10:
+                    seg = _crop_at_xpoint(seg, R0, Z0)
 
             if seg is None or len(seg) < 4:
                 contour_data.append(np.array([[R0, Z0]]))
@@ -936,26 +1093,29 @@ class GEQDSKEquilibrium:
                 avg["R**2"][k] = R0**2
                 continue
 
-            # Resample to equally-spaced arc-length using periodic cubic
-            # spline.  This smooths contourpy discretisation artefacts and
-            # gives uniform quadrature weights.
+            # Resample to equally-spaced arc-length using cubic spline.
+            # This smooths contourpy discretisation artefacts and gives
+            # uniform quadrature weights.
             #
-            # Near the separatrix (psi_N ≳ 0.99) the X-point cusp makes
-            # arc-length resampling problematic: a periodic cubic spline
-            # would smooth the cusp, distorting the contour.  Two options:
-            #   "theta"      — OMFIT-style angular resampling preserves the
-            #                   cusp via non-periodic spline in θ-space.
-            #   "arc_length" — fall back to raw contourpy points (no
-            #                   resampling) for near-separatrix surfaces.
-            if pn < 0.99 and len(seg) >= 20:
-                # Interior: always periodic arc-length resampling
-                r_s, z_s = _resample_contour(seg[:, 0], seg[:, 1], npts=257)
-            elif self._resample_method == "theta" and len(seg) >= 20:
-                # Near-separatrix: angular resampling preserves X-point cusp
-                r_s, z_s = _resample_contour_theta(
-                    seg[:, 0], seg[:, 1], R0, Z0, npts=257,
-                    theta_xpt=theta_xpt,
+            # Interior surfaces (psi_N < 0.99): periodic arc-length spline.
+            # Near-separatrix (0.99 <= psi_N < 1.0): non-periodic spline
+            #   so the X-point cusp is preserved.
+            # Separatrix (psi_N == 1.0): use the g-file boundary raw
+            #   (no resampling) — this matches OMFIT which uses
+            #   RBBBS/ZBBBS directly.  Resampling would smooth the
+            #   X-point cusp and distort Bp/q averages.
+            if pn == 1.0:
+                # Separatrix: use raw boundary points (OMFIT parity)
+                r_s, z_s = seg[:, 0].copy(), seg[:, 1].copy()
+                r_s[-1], z_s[-1] = r_s[0], z_s[0]
+            elif pn >= 0.99 and len(seg) >= 20:
+                # Near-separatrix: non-periodic arc-length resampling
+                r_s, z_s = _resample_contour(
+                    seg[:, 0], seg[:, 1], npts=257, periodic=False,
                 )
+            elif len(seg) >= 20:
+                # Interior: periodic arc-length resampling
+                r_s, z_s = _resample_contour(seg[:, 0], seg[:, 1], npts=257)
             else:
                 # Fallback: raw contourpy points
                 r_s, z_s = seg[:, 0].copy(), seg[:, 1].copy()
@@ -1055,6 +1215,20 @@ class GEQDSKEquilibrium:
             x = psi_N_levels[1:3]
             y = avg["q"][1:3]
             avg["q"][0] = y[0] - (y[1] - y[0]) / (x[1] - x[0]) * x[0]
+
+        # Fix near-axis geometry following OMFIT's approach
+        # (fluxSurface.py lines 1627-1641):
+        #  - kapu/kapl: linear extrapolation from first 2 interior surfaces
+        #  - kappa = 0.5*(kapu + kapl)
+        #  - delta/delu/dell = 0 at the axis (circle has zero triangularity)
+        if psi_N_levels[0] == 0 and nc > 2:
+            x = psi_N_levels[1:]
+            for gk in ["kapu", "kapl"]:
+                y = geo_arrays[gk][1:]
+                geo_arrays[gk][0] = y[1] - ((y[1] - y[0]) / (x[1] - x[0])) * x[1]
+            geo_arrays["kappa"][0] = 0.5 * (geo_arrays["kapu"][0] + geo_arrays["kapl"][0])
+            for gk in ["delta", "delu", "dell"]:
+                geo_arrays[gk][0] = 0.0
 
         # Analytic Grad-Shafranov current densities — more accurate than
         # numerically averaging curl(B)/μ₀, especially at the edge where
