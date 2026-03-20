@@ -1338,6 +1338,36 @@ class GEQDSKEquilibrium:
             if vol > 0 and abs(Bpave) > 0:
                 betas["beta_p"] = abs(P_vol[-1] / (Bpave**2 / 2.0 / constants.mu_0) / vol)
 
+        # -----------------------------------------------------------
+        # Outboard midplane profiles (following OMFIT fluxSurface.py)
+        # -----------------------------------------------------------
+        # R_mid = geo_center + minor_radius  (outboard intersection)
+        # Z_mid = Z0 (magnetic axis)
+        # Br, Bz interpolated on the 2-D grid at (R_mid, Z_mid).
+        # Bp  = signed sqrt(Br² + Bz²)
+        # Bt  = F / R_mid
+        # -----------------------------------------------------------
+        mid = {}
+        mid["R"] = geo_arrays["R"] + geo_arrays["a"]
+        mid["Z"] = np.full(nc, Z0)
+
+        mid["Br"] = Br_interp.ev(mid["Z"], mid["R"])
+        mid["Bz"] = Bz_interp.ev(mid["Z"], mid["R"])
+
+        signBp = (
+            -cc["sigma_rhotp"] * cc["sigma_RpZ"]
+            * np.sign(mid["Bz"])
+        )
+        mid["Bp"] = signBp * np.sqrt(mid["Br"] ** 2 + mid["Bz"] ** 2)
+        mid["Bp"][0] = 0.0  # axis: Bp = 0 by definition
+
+        mid["Bt"] = np.array([
+            float(F_interp(psi_N_levels[k])) / mid["R"][k]
+            for k in range(nc)
+        ])
+        mid["Btot"] = np.sqrt(mid["Bp"] ** 2 + mid["Bt"] ** 2)
+        self._cache["midplane"] = mid
+
         # Store everything
         self._cache["avg"] = avg
         self._cache["geo"] = geo_arrays
@@ -1433,6 +1463,20 @@ class GEQDSKEquilibrium:
         """
         self._trace_surfaces()
         return self._cache["avg"]
+
+    @property
+    def midplane(self):
+        """Outboard midplane quantities on the psi_N grid.
+
+        Computed following the OMFIT convention: the outboard midplane
+        point of each flux surface is at ``R = geo_center + a``,
+        ``Z = Z_axis``.  Magnetic field components are interpolated from
+        the 2-D ``(R, Z)`` grid at that point.
+
+        Keys: R, Z, Br, Bz, Bp, Bt, Btot
+        """
+        self._trace_surfaces()
+        return self._cache["midplane"]
 
     @property
     def betas(self):

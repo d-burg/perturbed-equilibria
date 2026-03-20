@@ -1032,7 +1032,23 @@ def plot_geqdsk_bouquet(geqdsk_path_or_eq=None, x_coord="psi_N",
                 load_pairs.extend((None, i) for i in range(n))
 
         eqs = []
-        from .utils import _group_path
+        from .utils import _group_path, _scan_val_key
+
+        # Load baseline geqdsk from _baseline group if available
+        baseline_eq = None
+        bl_scan = scan_val if scan_val is not None else (
+            load_pairs[0][0] if load_pairs else None)
+        if bl_scan is not None:
+            bl_key = _scan_val_key(bl_scan)
+            bl_grp = f"scan/{bl_key}/_baseline" if bl_key else "_baseline"
+        else:
+            bl_grp = "_baseline"
+        with h5py.File(h5path, "r") as hf:
+            if bl_grp in hf and "baseline.eqdsk" in hf[bl_grp]:
+                raw = bytes(hf[bl_grp]["baseline.eqdsk"][()])
+                baseline_eq = GEQDSKEquilibrium.from_bytes(raw)
+
+        # Load perturbed equilibria
         for sv, idx in load_pairs:
             grp_path = _group_path(sv, idx)
             with h5py.File(h5path, "r") as hf:
@@ -1043,6 +1059,11 @@ def plot_geqdsk_bouquet(geqdsk_path_or_eq=None, x_coord="psi_N",
                 if eqdsk_ds:
                     raw = bytes(grp[eqdsk_ds[0]][()])
                     eqs.append(GEQDSKEquilibrium.from_bytes(raw))
+
+        # Prepend baseline if found; otherwise first perturbed is "baseline"
+        if baseline_eq is not None:
+            eqs.insert(0, baseline_eq)
+
         if not eqs:
             print("No geqdsk data found in HDF5.")
             return None, None
@@ -1060,7 +1081,8 @@ def plot_geqdsk_bouquet(geqdsk_path_or_eq=None, x_coord="psi_N",
         raise ValueError("Provide geqdsk_path_or_eq or h5path")
 
     n_eq = len(eqs)
-    colors = plt.cm.tab10(np.linspace(0, 1, max(n_eq, 10)))
+    # h5 mode has a real baseline; file-list mode treats all entries equally
+    has_baseline = (h5path is not None and n_eq > 1)
 
     fig = plt.figure(figsize=(14, 6))
     gs = fig.add_gridspec(2, 3, width_ratios=[0.6, 1, 1],
@@ -1072,21 +1094,29 @@ def plot_geqdsk_bouquet(geqdsk_path_or_eq=None, x_coord="psi_N",
     ax_j = fig.add_subplot(gs[1, 1])
     ax_ff = fig.add_subplot(gs[1, 2])
 
-    # Plot baseline first (behind), then perturbed on top.
-    # All lines have the same width so perturbed traces are clearly visible.
+    # When loading from HDF5: baseline first (behind), then perturbed on top.
+    # When given a list of files: all plotted with the same style.
+    colors_list = plt.cm.tab10(np.linspace(0, 1, max(n_eq, 10)))
     for idx in [0] + list(range(1, n_eq)):
         eq = eqs[idx]
-        is_baseline = (idx == 0)
-        if is_baseline:
-            c = "k"
+        is_baseline = has_baseline and (idx == 0)
+        if has_baseline:
+            if is_baseline:
+                c = "k"
+                lw = 1.5
+                alpha = 1.0
+                lbl = "Baseline"
+            else:
+                c = "C1"
+                lw = 1.5
+                alpha = 0.7
+                lbl = "Perturbed" if idx == 1 else None
+        else:
+            # File-list mode: uniform styling
+            c = colors_list[idx] if n_eq > 1 else "k"
             lw = 1.5
             alpha = 1.0
-            lbl = "Baseline" if n_eq > 1 else None
-        else:
-            c = "C1"
-            lw = 1.0
-            alpha = 0.7
-            lbl = "Perturbed" if idx == 1 else None
+            lbl = None
 
         psi_N = np.linspace(0, 1, len(eq.pres))
         x, xlabel = _resolve_x_coord(psi_N, x_coord, eq=eq)
@@ -1134,7 +1164,7 @@ def plot_geqdsk_bouquet(geqdsk_path_or_eq=None, x_coord="psi_N",
     ax_lcfs.set_xlabel("R [m]")
     ax_lcfs.set_ylabel("Z [m]")
     ax_lcfs.set_title("Flux surfaces")
-    if n_eq > 1:
+    if has_baseline:
         ax_lcfs.legend(fontsize=6)
     ax_lcfs.grid(ls=":")
 
@@ -1159,7 +1189,7 @@ def plot_geqdsk_bouquet(geqdsk_path_or_eq=None, x_coord="psi_N",
     ax_ff.legend(fontsize=7)
     ax_ff.grid(ls=":")
 
-    if n_eq > 1:
+    if has_baseline:
         ax_p.legend(fontsize=6)
 
     plt.tight_layout()
@@ -1241,7 +1271,24 @@ def plot_pfile_bouquet(pfile_path_or_pf=None, x_coord="psi_N", eq=None,
                 load_pairs.extend((None, i) for i in range(n))
 
         pfiles = []
-        from .utils import _group_path
+        from .utils import _group_path, _scan_val_key
+
+        # Load baseline pfile from _baseline group if available
+        baseline_pf = None
+        bl_scan = scan_val if scan_val is not None else (
+            load_pairs[0][0] if load_pairs else None)
+        if bl_scan is not None:
+            bl_key = _scan_val_key(bl_scan)
+            bl_grp = f"scan/{bl_key}/_baseline" if bl_key else "_baseline"
+        else:
+            bl_grp = "_baseline"
+        with h5py.File(h5path, "r") as hf:
+            if bl_grp in hf and "baseline.pfile" in hf[bl_grp]:
+                raw = bytes(hf[bl_grp]["baseline.pfile"][()])
+                baseline_pf = _PFile.from_bytes(raw)
+
+        # Load perturbed pfiles (these now contain actual perturbed
+        # kinetic profiles, not copies of the baseline)
         for sv, idx in load_pairs:
             grp_path = _group_path(sv, idx)
             with h5py.File(h5path, "r") as hf:
@@ -1252,9 +1299,15 @@ def plot_pfile_bouquet(pfile_path_or_pf=None, x_coord="psi_N", eq=None,
                 if pf_ds:
                     raw = bytes(grp[pf_ds[0]][()])
                     pfiles.append(_PFile.from_bytes(raw))
+
+        # Prepend baseline if found
+        if baseline_pf is not None:
+            pfiles.insert(0, baseline_pf)
+
         if not pfiles:
             print("No p-file data found in HDF5. "
-                  "Pass pfile_bytes to generate_bouquet() to store p-files.")
+                  "Pass pfile_bytes to generate_bouquet() to store p-files, "
+                  "and eqdsk_bytes/pfile_bytes to store_baseline_profiles().")
             return None, None
     elif pfile_path_or_pf is not None:
         inputs = pfile_path_or_pf
@@ -1270,9 +1323,10 @@ def plot_pfile_bouquet(pfile_path_or_pf=None, x_coord="psi_N", eq=None,
         raise ValueError("Provide pfile_path_or_pf or h5path")
 
     n_pf = len(pfiles)
+    has_baseline = (h5path is not None and n_pf > 1)
     colors = plt.cm.tab10(np.linspace(0, 1, max(n_pf, 10)))
 
-    # Define the panel catalogue: (raw_key, label, units, special)
+    # Define the panel catalogue: (raw_key, label, units)
     _PANEL_KEYS = [
         ("ne",    r"$n_e$",                  r"$10^{20}$/m$^3$"),
         ("te",    r"$T_e$",                  "keV"),
@@ -1320,18 +1374,22 @@ def plot_pfile_bouquet(pfile_path_or_pf=None, x_coord="psi_N", eq=None,
         r, c = divmod(panel_idx, ncols)
         ax = axes[r][c]
 
-        # Plot baseline first (behind), then perturbed on top.
         draw_order = [0] + list(range(1, n_pf))
         for pf_idx in draw_order:
             pf = pfiles[pf_idx]
-            is_baseline = (pf_idx == 0)
-            if is_baseline:
-                col, lw, alpha = "k", 1.5, 1.0
-                lbl = "Baseline" if n_pf > 1 and panel_idx == 0 else None
+            is_baseline = has_baseline and (pf_idx == 0)
+            if has_baseline:
+                if is_baseline:
+                    col, lw, alpha = "k", 1.5, 1.0
+                    lbl = ("Baseline" if panel_idx == 0 else None)
+                else:
+                    col, lw, alpha = "C1", 1.5, 0.7
+                    lbl = ("Perturbed" if pf_idx == 1 and panel_idx == 0
+                           else None)
             else:
-                col, lw, alpha = "C1", 1.0, 0.7
-                lbl = ("Perturbed" if pf_idx == 1 and panel_idx == 0
-                       else None)
+                col = colors[pf_idx] if n_pf > 1 else "k"
+                lw, alpha = 1.5, 1.0
+                lbl = None
 
             if key == "zeff":
                 if (pf.ion_species is not None
@@ -1360,8 +1418,8 @@ def plot_pfile_bouquet(pfile_path_or_pf=None, x_coord="psi_N", eq=None,
             ax.set_xlabel(xlabel, fontsize=8)
         ax.grid(ls=":")
 
-    # Legend on the first panel when overplotting
-    if n_pf > 1 and n > 0:
+    # Legend on the first panel when overplotting from HDF5
+    if has_baseline and n > 0:
         axes[0][0].legend(fontsize=6)
 
     # Hide unused axes

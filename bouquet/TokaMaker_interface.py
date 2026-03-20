@@ -704,6 +704,8 @@ def generate_bouquet(
     scan_val=None,
     pfile_bytes=None,
     Zeff_profile=None,
+    baseline_eqdsk_bytes=None,
+    baseline_pfile_bytes=None,
 ):
     r"""Generate a batch of perturbed equilibria and archive to HDF5.
 
@@ -811,6 +813,8 @@ def generate_bouquet(
         sigma_ne, sigma_te, sigma_ni, sigma_ti, sigma_jphi,
         initial_Ip_target, l_i_target,
         scan_val=scan_val,
+        eqdsk_bytes=baseline_eqdsk_bytes,
+        pfile_bytes=baseline_pfile_bytes,
     )
 
     t_batch_start = time.perf_counter()
@@ -922,6 +926,75 @@ def generate_bouquet(
         # Extract coil currents from TokaMaker
         coil_current_dict, _ = mygs.get_coil_currents()
 
+        # ---- Build a perturbed p-file from the baseline p-file --------
+        # Start from the baseline so that profiles we don't perturb
+        # (beam density, rotation, kpol, etc.) are preserved as-is.
+        # Replace ne, te, ni, ti with the perturbed values, then
+        # recompute derived quantities (nz1, ptot, diamagnetic
+        # rotations, ExB decomposition) self-consistently.
+        perturbed_pfile_bytes = pfile_bytes  # fallback: original bytes
+        if pfile_bytes is not None:
+            try:
+                from .io.pfile import PFile as _PFile
+                from .io import GEQDSKEquilibrium as _GEQDSK
+                from scipy.interpolate import interp1d
+
+                pf = _PFile.from_bytes(pfile_bytes)
+
+                # Interpolate SI profiles → p-file grid & units
+                for pf_key, arr_si, scale in [
+                    ("ne", ne_perturb, 1e-20),   # m^-3 → 10^20/m^3
+                    ("te", te_perturb, 1e-3),     # eV   → keV
+                    ("ni", ni_perturb, 1e-20),
+                    ("ti", ti_perturb, 1e-3),
+                ]:
+                    if pf_key in pf:
+                        psi_grid = pf.psinorm_for(pf_key)
+                        vals = interp1d(
+                            psi_N, arr_si * scale,
+                            kind="cubic",
+                            fill_value="extrapolate",
+                        )(psi_grid)
+                        pf.set_profile(pf_key, psi_grid, vals)
+
+                # Recompute impurity density from quasi-neutrality
+                if "nz1" in pf and pf.ion_species is not None:
+                    pf.compute_quasineutrality()
+
+                # Recompute total pressure
+                pf.compute_pressure()
+
+                # Recompute diamagnetic rotations + decomposition
+                # using the perturbed equilibrium just written to disk
+                eq = _GEQDSK(full_path)
+                psi_pf = pf.psinorm_for("ne")
+                dpsi = eq.psi_boundary - eq.psi_axis
+                psi_Wb = psi_pf * dpsi + eq.psi_axis
+
+                pf.compute_diamagnetic_rotations(psi_Wb)
+
+                # Outboard midplane R, Bp, Bt for ExB / Er / Hahm-Burrell
+                mid = eq.midplane
+                psi_eq = eq.psi_N
+                R_mid = interp1d(
+                    psi_eq, mid["R"],
+                    fill_value="extrapolate")(psi_pf)
+                Bp_mid = interp1d(
+                    psi_eq, mid["Bp"],
+                    fill_value="extrapolate")(psi_pf)
+                Bt_mid = interp1d(
+                    psi_eq, mid["Bt"],
+                    fill_value="extrapolate")(psi_pf)
+
+                pf.compute_rotation_decomposition(
+                    R=R_mid, Bp=Bp_mid, Bt=Bt_mid, psi=psi_Wb)
+
+                perturbed_pfile_bytes = pf.to_bytes()
+            except Exception as exc:
+                import traceback
+                print(f"  WARNING: could not build perturbed p-file: {exc}")
+                traceback.print_exc()
+
         store_equilibrium(
             header, count, full_path,
             psi_N,
@@ -935,7 +1008,7 @@ def generate_bouquet(
             scan_val=scan_val,
             pressure=pressure_perturb,
             j_BS_edge=diagnostics["j_BS_edge"],
-            pfile_bytes=pfile_bytes,
+            pfile_bytes=perturbed_pfile_bytes,
             Zeff=Zeff_profile,
             coil_currents=coil_current_dict,
         )

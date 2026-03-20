@@ -352,6 +352,8 @@ def store_baseline_profiles(
     Ip_target,
     l_i_target,
     scan_val=None,
+    eqdsk_bytes=None,
+    pfile_bytes=None,
 ):
     """
     Store the input (baseline) profiles and their uncertainties.
@@ -359,6 +361,15 @@ def store_baseline_profiles(
     For hierarchical layout (*scan_val* is not ``None``), these are
     stored in ``scan/{label}/_baseline/``.  For flat layout they go
     in ``_baseline/``.
+
+    Parameters
+    ----------
+    eqdsk_bytes : bytes or None
+        Raw baseline geqdsk file content.  Stored so that
+        ``plot_geqdsk_bouquet`` can distinguish the true baseline
+        from perturbed equilibria.
+    pfile_bytes : bytes or None
+        Raw baseline p-file content.
 
     This data is written once per scan-point and is required by the
     plotting GUI to be fully self-contained.
@@ -392,6 +403,11 @@ def store_baseline_profiles(
 
         grp.attrs["Ip_target"]  = float(Ip_target)
         grp.attrs["l_i_target"] = float(l_i_target)
+
+        if eqdsk_bytes is not None:
+            grp.create_dataset("baseline.eqdsk", data=np.void(eqdsk_bytes))
+        if pfile_bytes is not None:
+            grp.create_dataset("baseline.pfile", data=np.void(pfile_bytes))
 
 
 # ====================================================================

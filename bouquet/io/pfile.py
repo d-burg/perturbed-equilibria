@@ -251,6 +251,25 @@ class PFile:
         """Write the profiles to *filename* in p-file format."""
         _write_pfile(self._raw, filename)
 
+    def to_bytes(self):
+        """Serialize to in-memory bytes (round-trip with ``from_bytes``).
+
+        Returns
+        -------
+        bytes
+            Raw p-file content.
+        """
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".pfile", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+        _write_pfile(self._raw, tmp_path)
+        with open(tmp_path, "rb") as fh:
+            data = fh.read()
+        import os
+        os.remove(tmp_path)
+        return data
+
     # --- Dict-like access ---
 
     @property
