@@ -893,6 +893,15 @@ class GEQDSKEquilibrium:
         return self._raw["PSIRZ"]
 
     @property
+    def psi_N_RZ(self):
+        """2-D normalised poloidal flux on the (R, Z) grid (NH x NW).
+
+        ``(psi - psi_axis) / (psi_boundary - psi_axis)``, ranging from
+        0 at the magnetic axis to 1 at the LCFS.
+        """
+        return (self._raw["PSIRZ"] - self.psi_axis) / (self.psi_boundary - self.psi_axis)
+
+    @property
     def psi_axis(self):
         """Poloidal flux at the magnetic axis."""
         return self._raw["SIMAG"]
