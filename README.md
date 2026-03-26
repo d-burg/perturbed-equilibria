@@ -45,6 +45,10 @@ HDF5 database.
 - **COCOS-aware GEQDSK reader** with full flux-surface geometry (κ, δ,
   squareness), safety factor, current density, and exact outboard-midplane
   profiles — all computed independently of external tools.
+- **COCOS conversion and Bt/Ip flip**: convert g-file data between any two
+  COCOS conventions (`cocosify`) and reverse the toroidal field / plasma
+  current directions (`flip_Bt_Ip`), with save-to-disk and HDF5 round-trip
+  support.  Verified field-by-field against OMFIT's `OMFITgeqdsk`.
 - **P-file reader/writer** supporting the Osborne format with 24+ profile
   types, diamagnetic rotation computation, E×B decomposition, and radial
   electric field.
@@ -94,7 +98,11 @@ from bouquet import GEQDSKEquilibrium, read_pfile
 eq = GEQDSKEquilibrium("g123456.01000")
 print(f"Ip = {eq.Ip/1e6:.3f} MA")
 print(f"q95 = {eq.q_profile[-1]:.2f}")
-print(f"li(1) = {eq.li1:.3f}")
+print(f"li(1) = {eq.li['li(1)']:.3f}")
+
+# Flux-surface-averaged current density (from p' and FF')
+j_phi = eq.j_tor_averaged            # <Jt/R> / <1/R>
+j_phi_direct = eq.j_tor_averaged_direct  # literal <Jt> from GS equation
 
 # Access flux-surface geometry
 geo = eq.geometry
@@ -108,6 +116,22 @@ print(f"R_mid at boundary: {mid['R'][-1]:.4f} m")
 pf = read_pfile("p123456.01000")
 ne = pf.get("ne")       # returns (psinorm, values, derivatives) tuple
 Te = pf.get("te")
+```
+
+### COCOS conversion and Bt/Ip flip
+
+```python
+from bouquet import GEQDSKEquilibrium, read_geqdsk
+
+# Load as COCOS 7, convert to COCOS 1, flip Bt/Ip
+eq = read_geqdsk("g123456.01000", cocos=7)
+eq.cocosify(1)       # in-place; use copy=True to get a new object
+eq.flip_Bt_Ip()      # in-place
+
+# Save to disk or serialise for HDF5
+eq.save("modified.geqdsk")
+raw_bytes = eq.to_bytes()          # for HDF5 storage
+eq2 = GEQDSKEquilibrium.from_bytes(raw_bytes, cocos=1)  # reconstruct
 ```
 
 ### Generating a bouquet (requires TokaMaker)
@@ -224,20 +248,30 @@ from bouquet import GEQDSKEquilibrium
 eq = GEQDSKEquilibrium("g123456.01000", cocos=1)
 ```
 
-| Property | Description |
-|----------|-------------|
+| Property / Method | Description |
+|-------------------|-------------|
 | `psi_N` | Normalised poloidal flux grid (0 → 1) |
+| `psi_N_RZ` | 2-D normalised poloidal flux on the (R, Z) grid |
 | `psi_axis`, `psi_boundary` | Axis and boundary flux (Wb) |
 | `Ip` | Plasma current (A, sign-corrected) |
 | `q_profile` | Safety factor on psi_N |
-| `j_tor_averaged_direct` | Flux-surface-averaged toroidal current density |
+| `j_tor_averaged` | `<Jt/R>/<1/R>` — standard convention (OMFIT, TRANSP) |
+| `j_tor_averaged_direct` | Literal `<Jt>` from p' and FF' (GS equation) |
 | `geometry` | Dict with R, Z, a, κ, δ, squareness per surface |
 | `midplane` | Exact outboard-midplane R, Bp, Bt, Btot |
 | `rhovn` | Normalised toroidal flux coordinate |
-| `li1`, `li3` | Internal inductance (EFIT and alternative definitions) |
+| `li` | Internal inductance dict (li(1), li(2), li(3), …) |
+| `betas` | Plasma beta values (beta_t, beta_p, beta_n) |
+| `cocos` | Current COCOS convention index |
+| `cocosify(out)` | Convert between COCOS conventions (in-place or copy) |
+| `flip_Bt_Ip()` | Reverse Bt and Ip signs (in-place or copy) |
+| `save(path)` | Write modified g-file to disk |
+| `to_bytes()` | Serialise to bytes for HDF5 storage |
 | `from_bytes()` | Construct from in-memory bytes |
 
-COCOS conventions 1–8 and 11–18 are fully supported.
+COCOS conventions 1–8 and 11–18 are fully supported.  See
+[`bouquet/io/GEQDSK_QUANTITIES.md`](bouquet/io/GEQDSK_QUANTITIES.md)
+for a complete reference of every derived quantity.
 
 ### P-File Reader/Writer
 
@@ -374,6 +408,8 @@ Example notebooks are in the `examples/` directory:
 | `basic_example.ipynb` | Fundamental workflow walkthrough |
 | `g-file_p-file_example.ipynb` | GEQDSK and p-file I/O demonstration |
 | `D3D-like/` | DIII-D-like tokamak equilibrium perturbation |
+| `COCOS_Bt_Ip/cocos_and_save_example.ipynb` | COCOS conversion, Bt/Ip flip, save to disk/HDF5 |
+| `COCOS_Bt_Ip/omfit_cocos_comparison.ipynb` | Field-by-field validation against OMFIT (requires `omfit_classes`) |
 | `omfit-comparison/` | Verification against OMFIT reference values |
 
 ---
@@ -444,7 +480,8 @@ in [`architecture.md`](architecture.md). Key topics include:
 | Class / Function | Description |
 |------------------|-------------|
 | `GEQDSKEquilibrium` | Full-featured GEQDSK reader with flux-surface analysis |
-| `read_geqdsk()` | Parse a GEQDSK file to a raw dictionary |
+| `read_geqdsk()` | Parse a GEQDSK file (returns GEQDSKEquilibrium) |
+| `write_geqdsk()` | Write a raw g-file dict to disk |
 | `PFile` | P-file reader/writer with rotation computation |
 | `read_pfile()` | Parse a p-file (returns PFile object) |
 

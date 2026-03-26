@@ -217,6 +217,73 @@ def _read_geqdsk(filename):
 
 
 # ---------------------------------------------------------------------------
+# Section 2b: GEQDSK writer
+# ---------------------------------------------------------------------------
+
+def _write_fortran_block(stream, values):
+    """Write *values* in standard GEQDSK format (5 per line, 16 chars each)."""
+    for i, v in enumerate(values):
+        stream.write(f"{v:16.9E}")
+        if (i + 1) % 5 == 0:
+            stream.write("\n")
+    if len(values) % 5 != 0:
+        stream.write("\n")
+
+
+def _write_geqdsk_to_stream(g, stream):
+    """Serialise a raw g-file dict *g* to an open text *stream*."""
+    NW = int(g["NW"])
+    NH = int(g["NH"])
+
+    # Header
+    case_arr = g.get("CASE", np.array([" " * 8] * 6))
+    case_str = "".join(c.ljust(8)[:8] for c in case_arr)[:48]
+    stream.write(f"{case_str}   0 {NW:4d} {NH:4d}\n")
+
+    # 20 scalars
+    scalars = [
+        g["RDIM"], g["ZDIM"], g["RCENTR"], g["RLEFT"], g["ZMID"],
+        g["RMAXIS"], g["ZMAXIS"], g["SIMAG"], g["SIBRY"], g["BCENTR"],
+        g["CURRENT"], g["SIMAG"], 0.0, g["RMAXIS"], 0.0,
+        g["ZMAXIS"], 0.0, g["SIBRY"], 0.0, 0.0,
+    ]
+    _write_fortran_block(stream, scalars)
+
+    # 1-D profiles
+    for name in ("FPOL", "PRES", "FFPRIM", "PPRIME"):
+        _write_fortran_block(stream, g[name])
+
+    # 2-D poloidal flux
+    _write_fortran_block(stream, g["PSIRZ"].ravel())
+
+    # Safety factor
+    _write_fortran_block(stream, g["QPSI"])
+
+    # Boundary and limiter
+    nbbbs = int(g.get("NBBBS", len(g.get("RBBBS", []))))
+    nlim = int(g.get("LIMITR", len(g.get("RLIM", []))))
+    stream.write(f" {nbbbs:5d} {nlim:5d}\n")
+
+    if nbbbs > 0:
+        bnd = np.empty(2 * nbbbs)
+        bnd[0::2] = g["RBBBS"][:nbbbs]
+        bnd[1::2] = g["ZBBBS"][:nbbbs]
+        _write_fortran_block(stream, bnd)
+
+    if nlim > 0:
+        lim = np.empty(2 * nlim)
+        lim[0::2] = g["RLIM"][:nlim]
+        lim[1::2] = g["ZLIM"][:nlim]
+        _write_fortran_block(stream, lim)
+
+
+def _write_geqdsk(g, filename):
+    """Write a raw g-file dict to *filename*."""
+    with open(filename, "w") as f:
+        _write_geqdsk_to_stream(g, f)
+
+
+# ---------------------------------------------------------------------------
 # Section 3: Contour tracing
 # ---------------------------------------------------------------------------
 
@@ -727,6 +794,7 @@ class GEQDSKEquilibrium:
     def __init__(self, filename, cocos=1, nlevels=None, resample="theta",
                  extrapolate_edge=True):
         self._raw = _read_geqdsk(filename)
+        self._cocos_index = int(cocos)
         self._cocos = _cocos_params(cocos)
         self._nlevels = nlevels if nlevels is not None else int(self._raw["NW"])
         if resample not in ("theta", "arc_length"):
@@ -763,6 +831,36 @@ class GEQDSKEquilibrium:
         return cls(tmp_path, cocos=cocos, nlevels=nlevels, resample=resample,
                    extrapolate_edge=extrapolate_edge)
 
+    @classmethod
+    def from_raw(cls, raw_dict, cocos=1, nlevels=None, resample="theta",
+                 extrapolate_edge=True):
+        """Construct directly from a raw g-file dict (no file I/O).
+
+        Parameters
+        ----------
+        raw_dict : dict
+            Dictionary with standard GEQDSK keys (as returned by
+            ``_read_geqdsk``).  A shallow copy is made internally.
+        cocos : int
+            COCOS index for the data.
+        nlevels, resample, extrapolate_edge :
+            Same as ``__init__``.
+        """
+        obj = object.__new__(cls)
+        obj._raw = {k: (v.copy() if isinstance(v, np.ndarray) else v)
+                     for k, v in raw_dict.items()}
+        obj._cocos_index = int(cocos)
+        obj._cocos = _cocos_params(cocos)
+        obj._nlevels = nlevels if nlevels is not None else int(obj._raw["NW"])
+        if resample not in ("theta", "arc_length"):
+            raise ValueError(
+                f"resample must be 'theta' or 'arc_length', got {resample!r}"
+            )
+        obj._resample_method = resample
+        obj._extrapolate_edge = bool(extrapolate_edge)
+        obj._cache = {}
+        return obj
+
     # --- Raw data properties ---
 
     @property
@@ -793,6 +891,15 @@ class GEQDSKEquilibrium:
     def psi_RZ(self):
         """2-D poloidal flux array (NH x NW)."""
         return self._raw["PSIRZ"]
+
+    @property
+    def psi_N_RZ(self):
+        """2-D normalised poloidal flux on the (R, Z) grid (NH x NW).
+
+        ``(psi - psi_axis) / (psi_boundary - psi_axis)``, ranging from
+        0 at the magnetic axis to 1 at the LCFS.
+        """
+        return (self._raw["PSIRZ"] - self.psi_axis) / (self.psi_boundary - self.psi_axis)
 
     @property
     def psi_axis(self):
@@ -899,6 +1006,138 @@ class GEQDSKEquilibrium:
         if abs(phi_edge) < 1e-30:
             return np.sqrt(np.linspace(0, 1, NW))
         return np.sqrt(np.abs(phi / phi_edge))
+
+    # --- COCOS property ---
+
+    @property
+    def cocos(self):
+        """Current COCOS convention index."""
+        return self._cocos_index
+
+    # --- COCOS conversion and sign-flip methods ---
+
+    def cocosify(self, cocos_out, copy=False):
+        """Convert the raw g-file data from the current COCOS to *cocos_out*.
+
+        Applies the multiplicative sign/2π factors to every relevant
+        field following Sauter & Medvedev, Comput. Phys. Commun. 184
+        (2013) 293, Eq. 14/23.
+
+        Parameters
+        ----------
+        cocos_out : int
+            Target COCOS convention index (1-8 or 11-18).
+        copy : bool
+            If ``True``, return a **new** ``GEQDSKEquilibrium`` with the
+            converted data, leaving this object unchanged.  If ``False``
+            (default), convert **in place** and return ``self``.
+
+        Returns
+        -------
+        GEQDSKEquilibrium
+            The converted object (``self`` when *copy=False*).
+        """
+        cc_in = _cocos_params(self._cocos_index)
+        cc_out = _cocos_params(cocos_out)
+
+        # Effective transformation parameters (Eq. 23)
+        sigma_Bp_eff = cc_out["sigma_Bp"] * cc_in["sigma_Bp"]
+        sigma_RpZ_eff = cc_out["sigma_RpZ"] * cc_in["sigma_RpZ"]
+        sigma_rhotp_eff = cc_out["sigma_rhotp"] * cc_in["sigma_rhotp"]
+        exp_Bp_eff = cc_out["exp_Bp"] - cc_in["exp_Bp"]
+
+        # sigma_Ip_eff = sigma_B0_eff = sigma_RpZ_eff
+        twopi_exp = (2.0 * np.pi) ** exp_Bp_eff
+
+        # Multiplicative factors
+        psi_factor = sigma_RpZ_eff * sigma_Bp_eff * twopi_exp
+        dpsi_factor = sigma_RpZ_eff * sigma_Bp_eff / twopi_exp
+        bt_factor = sigma_RpZ_eff
+        ip_factor = sigma_RpZ_eff
+        q_factor = sigma_rhotp_eff  # = sigma_Ip*sigma_B0*sigma_rhotp_eff
+
+        target = self._copy_for_mutation() if copy else self
+
+        # Apply to raw dict
+        g = target._raw
+        for key in ("SIMAG", "SIBRY"):
+            g[key] *= psi_factor
+        g["PSIRZ"] = g["PSIRZ"] * psi_factor
+        g["PPRIME"] = g["PPRIME"] * dpsi_factor
+        g["FFPRIM"] = g["FFPRIM"] * dpsi_factor
+        g["FPOL"] = g["FPOL"] * bt_factor
+        g["BCENTR"] *= bt_factor
+        g["CURRENT"] *= ip_factor
+        g["QPSI"] = g["QPSI"] * q_factor
+
+        # Update COCOS bookkeeping
+        target._cocos_index = int(cocos_out)
+        target._cocos = cc_out
+        target._cache.clear()
+        return target
+
+    def flip_Bt_Ip(self, copy=False):
+        """Reverse the signs of Bt and Ip in the raw g-file data.
+
+        This negates ``BCENTR``, ``FPOL``, ``CURRENT``, ``PSIRZ``,
+        ``SIMAG``, ``SIBRY``, ``PPRIME``, and ``FFPRIM`` — equivalent
+        to flipping the direction of both the toroidal field and the
+        plasma current while keeping the COCOS index unchanged.
+
+        Parameters
+        ----------
+        copy : bool
+            If ``True``, return a new object; otherwise modify in place.
+
+        Returns
+        -------
+        GEQDSKEquilibrium
+        """
+        target = self._copy_for_mutation() if copy else self
+        g = target._raw
+
+        g["BCENTR"] *= -1
+        g["FPOL"] = g["FPOL"] * -1
+        g["CURRENT"] *= -1
+        g["SIMAG"] *= -1
+        g["SIBRY"] *= -1
+        g["PSIRZ"] = g["PSIRZ"] * -1
+        g["PPRIME"] = g["PPRIME"] * -1
+        g["FFPRIM"] = g["FFPRIM"] * -1
+
+        target._cache.clear()
+        return target
+
+    def _copy_for_mutation(self):
+        """Return a deep-enough copy for mutation (cocosify / flip)."""
+        return GEQDSKEquilibrium.from_raw(
+            self._raw, cocos=self._cocos_index,
+            nlevels=self._nlevels, resample=self._resample_method,
+            extrapolate_edge=self._extrapolate_edge,
+        )
+
+    # --- Save / serialise ---
+
+    def save(self, filename):
+        """Write the (possibly modified) g-file data to *filename*.
+
+        Parameters
+        ----------
+        filename : str or path-like
+            Output path.
+        """
+        _write_geqdsk(self._raw, filename)
+
+    def to_bytes(self):
+        """Serialise to in-memory bytes (round-trips with ``from_bytes``).
+
+        Returns
+        -------
+        bytes
+        """
+        buf = io.StringIO()
+        _write_geqdsk_to_stream(self._raw, buf)
+        return buf.getvalue().encode("ascii")
 
     # --- Lazy field computation ---
 

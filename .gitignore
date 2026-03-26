@@ -35,7 +35,12 @@ env/
 # TokaMaker / OFT runtime output (adjust to actual filenames)
 *.eqdsk
 *.geqdsk
+!examples/**/*.eqdsk
+!examples/**/*.geqdsk
 g*.txt        # EFIT-style g-files if relevant
+
+# Claude Code
+.claude/
 
 # OS
 .DS_Store

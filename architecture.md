@@ -71,6 +71,66 @@ quantities, safety factor, and current density.
 
 **User control:** The `cocos` parameter on `GEQDSKEquilibrium`.
 
+### 2.1b COCOS Conversion (`cocosify`)
+
+`GEQDSKEquilibrium.cocosify(cocos_out)` converts the raw g-file data
+from the current COCOS to any target COCOS, following the transformation
+rules in Sauter & Medvedev (2013), Eq. 14/23.
+
+The effective transformation parameters between `cocos_in` and
+`cocos_out` are:
+
+```
+sigma_Bp_eff    = sigma_Bp_out    * sigma_Bp_in
+sigma_RpZ_eff   = sigma_RpZ_out   * sigma_RpZ_in
+sigma_rhotp_eff = sigma_rhotp_out * sigma_rhotp_in
+exp_Bp_eff      = exp_Bp_out      - exp_Bp_in
+```
+
+The multiplicative factors applied to each g-file field:
+
+| Field | Factor |
+|-------|--------|
+| PSIRZ, SIMAG, SIBRY | `sigma_RpZ_eff * sigma_Bp_eff * (2π)^exp_Bp_eff` |
+| PPRIME, FFPRIM | `sigma_RpZ_eff * sigma_Bp_eff / (2π)^exp_Bp_eff` |
+| FPOL, BCENTR | `sigma_RpZ_eff` |
+| CURRENT | `sigma_RpZ_eff` |
+| QPSI | `sigma_rhotp_eff` |
+
+These factors have been verified field-by-field against OMFIT's
+`OMFITgeqdsk.cocosify()` for COCOS 1→7, 1→11, 7→1, and 7→11
+(see `examples/COCOS_Bt_Ip/omfit_cocos_comparison.ipynb`).
+
+**Caveat:** `cocosify` transforms the raw numerical arrays but does
+not re-derive any cached quantities.  The cache is cleared on every
+call, so subsequent property accesses (q_profile, geometry, etc.)
+will recompute using the new COCOS parameters.
+
+### 2.1c Bt/Ip Flip (`flip_Bt_Ip`)
+
+`GEQDSKEquilibrium.flip_Bt_Ip()` reverses the direction of both
+the toroidal field and the plasma current.  This negates:
+
+- `BCENTR`, `FPOL` (toroidal field direction)
+- `CURRENT` (plasma current direction)
+- `SIMAG`, `SIBRY`, `PSIRZ` (poloidal flux)
+- `PPRIME`, `FFPRIM` (per-psi derivatives)
+
+The safety factor `QPSI` is **unchanged** because q ∝ Bt/Ip and
+both signs cancel.
+
+**Use case:** Converting between experiments with opposite field
+and current directions (e.g. forward vs. reversed Bt operation on
+DIII-D).
+
+### 2.1d Serialisation (`save`, `to_bytes`)
+
+Modified equilibria can be written back to standard GEQDSK format
+via `save(filename)` or serialised to bytes via `to_bytes()` for
+HDF5 storage.  The writer uses the same fixed-format (5 values per
+line, 16 chars each) as the parser expects, ensuring exact
+round-trip fidelity.
+
 ### 2.2 Normalised Poloidal Flux (psi_N)
 
 Defined as:
