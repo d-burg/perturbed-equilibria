@@ -790,6 +790,23 @@ def generate_bouquet(
     """
     all_diagnostics = []
 
+    # --- Auto-override constrain_sawteeth for sawtoothing baselines ---
+    # If the baseline equilibrium already has q_0 < 1, constraining
+    # perturbed equilibria to q_0 >= 1 is incompatible and will cause
+    # every candidate to be rejected.  Detect this and override.
+    if constrain_sawteeth:
+        _, q_baseline_check, _, _, _, _ = mygs.get_q(
+            npsi=len(psi_N), psi_pad=psi_pad
+        )
+        if q_baseline_check[0] < 1.0:
+            print(
+                f"NOTE: Baseline equilibrium has q(0) = {q_baseline_check[0]:.4f} < 1.0 "
+                f"(sawtoothing plasma).\n"
+                f"      Overriding constrain_sawteeth = False so perturbed "
+                f"equilibria are not rejected."
+            )
+            constrain_sawteeth = False
+
     # self-consistent pressure for baseline <P>
     pressure = EC * (ne * te + ni * ti)
     npsi = len(pressure)
