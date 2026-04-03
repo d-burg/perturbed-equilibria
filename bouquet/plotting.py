@@ -1518,3 +1518,217 @@ def plot_coil_currents(h5path_or_header, scan_val=None):
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     return fig, ax
+
+
+# ====================================================================
+#  Trace plots: l_i, Ip, boundary deviation across equilibria
+# ====================================================================
+def plot_traces(h5path_or_header, scan_value="all"):
+    r"""Plot l_i, Ip, and boundary deviation traces across equilibria.
+
+    Produces three figures:
+      1. **l_i** — top: actual l_i(1) values; bottom: % error vs target
+      2. **Ip** — top: actual Ip values; bottom: % error vs target
+      3. **Boundary** — top: RMS deviation [mm]; bottom: max deviation [mm]
+
+    Parameters
+    ----------
+    h5path_or_header : str
+        Path to ``.h5`` file or header string.
+    scan_value : str, float, int, or ``'all'``
+        Scan value to plot.  ``'all'`` (default) plots all scan values
+        on the same axes with different colours.
+
+    Returns
+    -------
+    figs : list of Figure
+        The three figures ``[fig_li, fig_Ip, fig_boundary]``.
+    """
+    from .utils import read_eqdsk_from_bytes
+
+    if not h5path_or_header.endswith(".h5"):
+        h5path = os.path.abspath(f"{h5path_or_header}.h5")
+    else:
+        h5path = os.path.abspath(h5path_or_header)
+
+    # Discover scan values
+    if scan_value == "all":
+        scan_vals = discover_scan_values(h5path)
+        if not scan_vals:
+            scan_vals = [None]
+    else:
+        scan_vals = [scan_value]
+
+    colors = _cm.tab10(np.linspace(0, 0.9, max(len(scan_vals), 1)))
+
+    # ---- Collect data across all scan values ----
+    all_traces = {}  # {scan_val: {indices, li1, li3, Ip, bnd_rms, bnd_max}}
+
+    for sv in scan_vals:
+        bl = load_baseline_profiles(h5path, scan_value=sv)
+        Ip_target = float(bl.get("Ip_target", 0))
+        li_target = float(bl.get("l_i_target", 0))
+
+        # Get input geqdsk boundary for deviation calculation.
+        # Try baseline eqdsk bytes first, then stored boundary arrays.
+        bl_boundary = None
+        from .utils import read_eqdsk_from_bytes as _read_eqdsk
+        bl_eqdsk_key = None
+        with h5py.File(h5path, "r") as hf:
+            bkey_bl = _scan_val_key(sv)
+            bl_grp_path = f"scan/{bkey_bl}/_baseline" if bkey_bl else "_baseline"
+            if bl_grp_path in hf:
+                bl_grp = hf[bl_grp_path]
+                eqdsk_keys = [k for k in bl_grp.keys() if k.endswith(".eqdsk")]
+                if eqdsk_keys:
+                    try:
+                        raw = bytes(bl_grp[eqdsk_keys[0]][()])
+                        eq_bl = _read_eqdsk(raw, read_geqdsk)
+                        bl_boundary = np.column_stack(
+                            [eq_bl.boundary_R, eq_bl.boundary_Z])
+                    except Exception:
+                        pass
+        if bl_boundary is None:
+            bl_boundary_R = bl.get("eqdsk_boundary_R", None)
+            bl_boundary_Z = bl.get("eqdsk_boundary_Z", None)
+            if bl_boundary_R is not None and bl_boundary_Z is not None:
+                bl_boundary = np.column_stack([bl_boundary_R, bl_boundary_Z])
+
+        # Load all perturbed equilibria — read eqdsk bytes directly
+        # from HDF5 to extract Ip and boundary.
+        from .utils import _scan_val_key, read_eqdsk_from_bytes
+
+        bkey = _scan_val_key(sv)
+        indices = []
+        li1_vals, li3_vals = [], []
+        Ip_vals = []
+        bnd_rms_vals, bnd_max_vals = [], []
+
+        with h5py.File(h5path, "r") as hf:
+            if bkey is not None:
+                parent = hf[f"scan/{bkey}"]
+            else:
+                parent = hf
+            stored_counts = sorted(
+                int(k) for k in parent.keys()
+                if k not in ("_baseline", "scan") and k.isdigit()
+            )
+
+            for idx, count in enumerate(stored_counts):
+                grp = parent[str(count)]
+                indices.append(idx)
+                li1_vals.append(float(grp.attrs.get("l_i(1)", np.nan)))
+                li3_vals.append(float(grp.attrs.get("l_i(3)", np.nan)))
+
+                # Extract Ip and boundary from eqdsk bytes
+                eqdsk_ds = [k for k in grp.keys() if k.endswith(".eqdsk")]
+                if eqdsk_ds:
+                    try:
+                        raw = bytes(grp[eqdsk_ds[0]][()])
+                        eq = read_eqdsk_from_bytes(raw, read_geqdsk)
+                        Ip_vals.append(abs(eq.Ip))
+
+                        if bl_boundary is not None:
+                            tree = _cKDTree(
+                                np.column_stack([eq.boundary_R, eq.boundary_Z])
+                            )
+                            devs, _ = tree.query(bl_boundary)
+                            bnd_rms_vals.append(np.sqrt(np.mean(devs**2)) * 1e3)
+                            bnd_max_vals.append(np.max(devs) * 1e3)
+                        else:
+                            bnd_rms_vals.append(np.nan)
+                            bnd_max_vals.append(np.nan)
+                    except Exception:
+                        Ip_vals.append(np.nan)
+                        bnd_rms_vals.append(np.nan)
+                        bnd_max_vals.append(np.nan)
+                else:
+                    Ip_vals.append(np.nan)
+                    bnd_rms_vals.append(np.nan)
+                    bnd_max_vals.append(np.nan)
+
+        all_traces[sv] = {
+            "indices": np.array(indices),
+            "li1": np.array(li1_vals),
+            "li3": np.array(li3_vals),
+            "Ip": np.array(Ip_vals),
+            "bnd_rms": np.array(bnd_rms_vals),
+            "bnd_max": np.array(bnd_max_vals),
+            "Ip_target": Ip_target,
+            "li_target": li_target,
+        }
+
+    # ---- Figure 1: l_i ----
+    fig_li, axes_li = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
+
+    for (sv, tr), c in zip(all_traces.items(), colors):
+        lbl = f"scan={sv}" if len(scan_vals) > 1 else None
+        x = tr["indices"]
+
+        axes_li[0].plot(x, tr["li1"], 'o-', color=c, lw=1.5, ms=4, label=lbl)
+        axes_li[0].axhline(tr["li_target"], color=c, ls='--', lw=1, alpha=0.5)
+
+        if tr["li_target"] > 0:
+            li_pct = 100.0 * (tr["li1"] - tr["li_target"]) / tr["li_target"]
+            axes_li[1].plot(x, li_pct, 'o-', color=c, lw=1.5, ms=4, label=lbl)
+            axes_li[1].axhline(0, color='k', ls=':', lw=0.5)
+
+    axes_li[0].set_ylabel(r"$l_i(1)$")
+    axes_li[0].set_title(r"$l_i$ trace")
+    axes_li[0].grid(True, alpha=0.3)
+    if len(scan_vals) > 1:
+        axes_li[0].legend(fontsize=7)
+
+    axes_li[1].set_xlabel("Equilibrium index")
+    axes_li[1].set_ylabel(r"$l_i$ error [%]")
+    axes_li[1].grid(True, alpha=0.3)
+    fig_li.tight_layout()
+
+    # ---- Figure 2: Ip ----
+    fig_Ip, axes_Ip = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
+
+    for (sv, tr), c in zip(all_traces.items(), colors):
+        lbl = f"scan={sv}" if len(scan_vals) > 1 else None
+        x = tr["indices"]
+
+        axes_Ip[0].plot(x, tr["Ip"] / 1e6, 'o-', color=c, lw=1.5, ms=4, label=lbl)
+        axes_Ip[0].axhline(tr["Ip_target"] / 1e6, color=c, ls='--', lw=1, alpha=0.5)
+
+        if tr["Ip_target"] > 0:
+            Ip_pct = 100.0 * (tr["Ip"] - tr["Ip_target"]) / tr["Ip_target"]
+            axes_Ip[1].plot(x, Ip_pct, 'o-', color=c, lw=1.5, ms=4, label=lbl)
+            axes_Ip[1].axhline(0, color='k', ls=':', lw=0.5)
+
+    axes_Ip[0].set_ylabel(r"$I_p$ [MA]")
+    axes_Ip[0].set_title(r"$I_p$ trace")
+    axes_Ip[0].grid(True, alpha=0.3)
+    if len(scan_vals) > 1:
+        axes_Ip[0].legend(fontsize=7)
+
+    axes_Ip[1].set_xlabel("Equilibrium index")
+    axes_Ip[1].set_ylabel(r"$I_p$ error [%]")
+    axes_Ip[1].grid(True, alpha=0.3)
+    fig_Ip.tight_layout()
+
+    # ---- Figure 3: Boundary deviation ----
+    fig_bnd, axes_bnd = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
+
+    for (sv, tr), c in zip(all_traces.items(), colors):
+        lbl = f"scan={sv}" if len(scan_vals) > 1 else None
+        x = tr["indices"]
+
+        axes_bnd[0].plot(x, tr["bnd_rms"], 'o-', color=c, lw=1.5, ms=4, label=lbl)
+        axes_bnd[1].plot(x, tr["bnd_max"], 's-', color=c, lw=1.5, ms=4, label=lbl)
+
+    axes_bnd[0].set_ylabel("RMS deviation [mm]")
+    axes_bnd[0].set_title("Boundary deviation vs input geqdsk")
+    axes_bnd[0].grid(True, alpha=0.3)
+    if len(scan_vals) > 1:
+        axes_bnd[0].legend(fontsize=7)
+
+    axes_bnd[1].set_xlabel("Equilibrium index")
+    axes_bnd[1].set_ylabel("Max deviation [mm]")
+    axes_bnd[1].grid(True, alpha=0.3)
+    fig_bnd.tight_layout()
+
+    return [fig_li, fig_Ip, fig_bnd]

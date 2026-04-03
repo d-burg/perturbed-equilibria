@@ -43,6 +43,7 @@ from .plotting import (
     plot_coil_currents,
     plot_kinetic_profiles,
     plot_jphi_profiles,
+    plot_traces,
 )
 
 from .io import (
