@@ -40,6 +40,363 @@ from .utils import (
     store_baseline_profiles,
 )
 
+# ---- Adaptive corrective iteration ----
+def _corrective_jphi_iteration(mygs, psi_N, target_jphi, pp_prof,
+                                Ip_target, pax_target, psi_pad,
+                                min_iters=2, max_iters=8,
+                                rtol=0.05, verbose=True):
+    r"""Iterate TokaMaker input j_phi until the output matches a target.
+
+    Uses Newton correction: ``input += (target - output)`` each step.
+    Starts with *min_iters*, then checks whether the edge spike RMS
+    is still improving by more than *rtol* relative per step.  Stops
+    when converged or *max_iters* is reached.
+
+    Parameters
+    ----------
+    mygs : TokaMaker
+        GS solver (in a solved state with current profiles set).
+    psi_N : ndarray
+        Normalised flux grid.
+    target_jphi : ndarray
+        Target j_phi profile [A/m²] (e.g. j_inductive + spike_profile).
+    pp_prof : dict
+        Pressure gradient profile dict for ``set_profiles``.
+    Ip_target : float
+        Plasma current target [A].
+    pax_target : float
+        On-axis pressure target [Pa].
+    psi_pad : float
+        LCFS padding.
+    min_iters : int
+        Minimum iterations before checking convergence (default 2).
+    max_iters : int
+        Maximum iterations (default 8).
+    rtol : float
+        Relative improvement threshold — stop if
+        ``|rms_new - rms_old| / rms_old < rtol`` (default 0.05 = 5%).
+    verbose : bool
+        Print per-iteration diagnostics.
+
+    Returns
+    -------
+    j_phi_output : ndarray
+        Converged GS output j_phi [A/m²].
+    n_iters : int
+        Number of iterations performed.
+    edge_rms_history : list of float
+        Edge RMS per iteration [A/m²].
+    """
+    from OpenFUSIONToolkit.TokaMaker.util import get_jphi_from_GS
+
+    npsi = len(psi_N)
+    edge_mask = psi_N > 0.9
+    j_phi_input = target_jphi.copy()
+    edge_rms_history = []
+
+    for it in range(max_iters):
+        ffp = {"type": "jphi-linterp", "y": j_phi_input.copy(), "x": psi_N}
+        mygs.set_targets(Ip=Ip_target, pax=pax_target)
+        mygs.set_profiles(pp_prof=pp_prof, ffp_prof=ffp)
+        mygs.solve()
+
+        _, f, fp, _, pp = mygs.get_profiles(npsi=npsi, psi_pad=psi_pad)
+        _, _, ravgs, _, _, _ = mygs.get_q(npsi=npsi, psi_pad=psi_pad)
+        j_phi_output = get_jphi_from_GS(f * fp, pp, ravgs[0], ravgs[1])
+
+        diff = j_phi_output - target_jphi
+        rms_edge = float(np.sqrt(np.mean(diff[edge_mask]**2)))
+        edge_rms_history.append(rms_edge)
+
+        if verbose:
+            print(f"  [jphi_corr iter {it+1}] edge RMS = {rms_edge/1e6:.6f} MA/m²")
+
+        # Check convergence after min_iters
+        if it >= min_iters - 1 and len(edge_rms_history) >= 2:
+            prev_rms = edge_rms_history[-2]
+            if prev_rms > 0:
+                rel_change = abs(rms_edge - prev_rms) / prev_rms
+                if rel_change < rtol:
+                    if verbose:
+                        print(f"  [jphi_corr] converged at iter {it+1} "
+                              f"(rel_change={rel_change:.4f} < {rtol})")
+                    break
+
+        # Newton correction
+        j_phi_input = j_phi_input + (target_jphi - j_phi_output)
+        j_phi_input = np.maximum(j_phi_input, 0.0)
+
+    return j_phi_output, it + 1, edge_rms_history
+
+
+# ---- j_phi profile classifier ----
+def classify_jphi_profile(psi_N, eqdsk_jphi, spike_profile,
+                          edge_psi_min=0.5, prominence_frac=0.15):
+    r"""Classify the edge current profile to determine reconstruction strategy.
+
+    Parameters
+    ----------
+    psi_N : ndarray
+        Normalised poloidal flux grid.
+    eqdsk_jphi : ndarray
+        Toroidal current density from the geqdsk [A/m²].
+    spike_profile : ndarray
+        Isolated edge bootstrap spike from ``analyze_bootstrap_edge_spike``
+        [A/m²].  Flat shelf in the core, rising spike at the edge.
+    edge_psi_min : float
+        Inner boundary of the edge search window (default 0.5).
+    prominence_frac : float
+        Minimum peak prominence as a fraction of the edge range
+        (default 0.15).
+
+    Returns
+    -------
+    mode : str
+        One of ``'H_mode'``, ``'Lmode_like_jphi'``, ``'L_mode'``.
+    metrics : dict
+        Edge spike metrics for reconstruction quality tracking.
+    """
+    from scipy.signal import find_peaks
+
+    metrics = {}
+    edge_mask = psi_N >= edge_psi_min
+
+    # --- Check Sauter spike ---
+    spike_edge = spike_profile[edge_mask]
+    psi_edge = psi_N[edge_mask]
+    shelf_val = spike_profile[0]
+    spike_range = np.max(spike_edge) - shelf_val
+
+    if spike_range > 0:
+        min_prom_spike = prominence_frac * spike_range
+        peaks_s, _ = find_peaks(spike_edge, height=shelf_val,
+                                prominence=min_prom_spike)
+    else:
+        peaks_s = np.array([], dtype=int)
+
+    if len(peaks_s) == 0:
+        # No Sauter edge spike → L_mode
+        metrics['spike_height_sauter'] = 0.0
+        metrics['spike_psiN_sauter'] = None
+        metrics['spike_height_geqdsk'] = None
+        metrics['spike_psiN_geqdsk'] = None
+        metrics['spike_height_ratio'] = None
+        metrics['spike_psiN_offset'] = None
+        print(f"[classify] L_mode — no Sauter edge spike detected")
+        return 'L_mode', metrics
+
+    # Sauter spike exists — record its peak
+    best_s = peaks_s[np.argmax(spike_edge[peaks_s])]
+    metrics['spike_height_sauter'] = float(spike_edge[best_s])
+    metrics['spike_psiN_sauter'] = float(psi_edge[best_s])
+
+    # --- Check geqdsk for an edge peak ---
+    geqdsk_edge = eqdsk_jphi[edge_mask]
+    geqdsk_baseline = geqdsk_edge[0]  # value at edge_psi_min
+    geqdsk_range = np.max(geqdsk_edge) - geqdsk_baseline
+
+    # Use prominence only — no height filter. The edge spike may be
+    # below the core value (j_phi decreases from core to edge) but
+    # still be a significant local peak.
+    geqdsk_max = np.max(geqdsk_edge)
+    if geqdsk_max > 0:
+        min_prom_g = prominence_frac * geqdsk_max
+        peaks_g, props_g = find_peaks(geqdsk_edge, prominence=min_prom_g)
+        # Filter to psi_N > 0.85 (true edge peaks, not shoulder of core)
+        if len(peaks_g) > 0:
+            far_edge = psi_edge[peaks_g] > 0.85
+            if np.any(far_edge):
+                peaks_g = peaks_g[far_edge]
+            else:
+                peaks_g = np.array([], dtype=int)
+    else:
+        peaks_g = np.array([], dtype=int)
+
+    if len(peaks_g) > 0:
+        # geqdsk has an edge peak → H_mode
+        best_g = peaks_g[np.argmax(geqdsk_edge[peaks_g])]
+        metrics['spike_height_geqdsk'] = float(geqdsk_edge[best_g])
+        metrics['spike_psiN_geqdsk'] = float(psi_edge[best_g])
+        metrics['spike_height_ratio'] = (
+            metrics['spike_height_sauter'] / metrics['spike_height_geqdsk']
+        )
+        metrics['spike_psiN_offset'] = (
+            metrics['spike_psiN_sauter'] - metrics['spike_psiN_geqdsk']
+        )
+        print(f"[classify] H_mode — geqdsk peak at psi_N={metrics['spike_psiN_geqdsk']:.4f} "
+              f"({metrics['spike_height_geqdsk']/1e6:.4f} MA/m²), "
+              f"Sauter peak at psi_N={metrics['spike_psiN_sauter']:.4f} "
+              f"({metrics['spike_height_sauter']/1e6:.4f} MA/m²), "
+              f"height ratio={metrics['spike_height_ratio']:.2f}, "
+              f"psiN offset={metrics['spike_psiN_offset']:.4f}")
+        return 'H_mode', metrics
+    else:
+        # geqdsk has no edge peak → Lmode_like_jphi
+        metrics['spike_height_geqdsk'] = None
+        metrics['spike_psiN_geqdsk'] = None
+        metrics['spike_height_ratio'] = None
+        metrics['spike_psiN_offset'] = None
+        print(f"[classify] Lmode_like_jphi — no geqdsk edge peak, "
+              f"Sauter spike at psi_N={metrics['spike_psiN_sauter']:.4f} "
+              f"({metrics['spike_height_sauter']/1e6:.4f} MA/m²)")
+        return 'Lmode_like_jphi', metrics
+
+
+# ---- Shelf-blend decomposition helper ----
+def _shelf_blend_decompose(psi_N, j_phi_total, spike_profile,
+                           eqdsk_jphi=None):
+    r"""Decompose j_phi into j_inductive + spike_profile.
+
+    In the core (where the spike shelf is flat), j_inductive = j_phi - spike.
+    At the edge (beyond the shelf), j_inductive is replaced by an
+    optimised cubic Hermite that:
+
+    - matches value and derivative of the core j_inductive at the
+      exact shelf-end index (C1 join, no blend window),
+    - minimises ``||j_ind_bridge + spike - eqdsk_jphi||²`` in the
+      edge region by optimising the two free slopes,
+    - is constrained to be monotonically decreasing and non-negative,
+    - arrives at ``max(eqdsk_jphi[-1] - spike_profile[-1], 0)``
+      at psi_N = 1.
+
+    Parameters
+    ----------
+    psi_N : ndarray
+        Normalised flux grid.
+    j_phi_total : ndarray
+        Total toroidal current density [A/m²].
+    spike_profile : ndarray
+        Isolated edge bootstrap spike [A/m²] (flat shelf + edge peak).
+    eqdsk_jphi : ndarray or None
+        Original geqdsk j_phi [A/m²].  Used to set the edge boundary
+        value and as the optimisation target.  If ``None``, a simple
+        linear taper is used.
+
+    Returns
+    -------
+    j_inductive : ndarray
+        Inductive component (non-negative, smooth edge taper).
+    shelf_psi : float
+        psi_N location where the shelf ends.
+    """
+    j_ind_raw = j_phi_total - spike_profile
+
+    # Find where the shelf ends
+    shelf_val = spike_profile[0]
+    shelf_end = 0
+    for i in range(1, len(spike_profile)):
+        if abs(spike_profile[i] - shelf_val) / max(abs(shelf_val), 1e-30) < 1e-6:
+            shelf_end = i
+        else:
+            break
+    shelf_psi = psi_N[shelf_end]
+
+    # Edge target: spike[-1] + j_ind[-1] = eqdsk[-1], unless spike dominates
+    if eqdsk_jphi is not None:
+        edge_target = max(eqdsk_jphi[-1] - spike_profile[-1], 0.0)
+    else:
+        edge_target = 0.0
+
+    # Value at shelf end (from core subtraction)
+    val_at_shelf = max(j_ind_raw[shelf_end], 0.0)
+
+    # Estimate the slope that j_inductive needs at the shelf end so that
+    # the TOTAL j_phi = j_ind + spike has a smooth derivative there.
+    #
+    # On the core side: dj_phi/dpsi = dj_ind/dpsi + 0 (spike is flat).
+    # On the edge side: dj_phi/dpsi = dj_ind/dpsi + dspike/dpsi.
+    # For C1 in total j_phi: the Hermite's dj_ind/dpsi at t=0 should
+    # equal the core dj_phi/dpsi minus the spike's derivative just
+    # past the shelf end.
+    #
+    # Core total j_phi slope (5-point stencil):
+    n_stencil = min(5, shelf_end)
+    if n_stencil >= 2:
+        _sl_idx = shelf_end - n_stencil
+        _sl_dy = j_ind_raw[shelf_end] - j_ind_raw[_sl_idx]
+        _sl_dx = psi_N[shelf_end] - psi_N[_sl_idx]
+        core_jphi_slope = _sl_dy / _sl_dx if _sl_dx > 0 else 0.0
+    else:
+        core_jphi_slope = 0.0
+
+    # Spike derivative just past the shelf end
+    if shelf_end < len(psi_N) - 2:
+        spike_slope_at_edge = ((spike_profile[shelf_end + 2] - spike_profile[shelf_end])
+                               / (psi_N[shelf_end + 2] - psi_N[shelf_end]))
+    else:
+        spike_slope_at_edge = 0.0
+
+    # j_inductive start slope = core total slope - spike slope
+    # so that dj_phi/dpsi = dj_ind/dpsi + dspike/dpsi = core total slope
+    core_slope_est = core_jphi_slope - spike_slope_at_edge
+
+    interval = 1.0 - shelf_psi
+
+    if interval <= 0 or eqdsk_jphi is None:
+        # Fallback: linear taper
+        j_ind = j_ind_raw.copy()
+        for i in range(len(psi_N)):
+            if psi_N[i] > shelf_psi:
+                t = (psi_N[i] - shelf_psi) / max(interval, 1e-30)
+                j_ind[i] = val_at_shelf * (1 - t) + edge_target * t
+        return np.maximum(j_ind, 0.0), shelf_psi
+
+    # Hermite bridge: 4 DOF, 3 fixed, 1 optimised.
+    #   Start value = val_at_shelf (C0 match, fixed)
+    #   Start slope = core_slope_est (C1 match, fixed)
+    #   End value   = edge_target (fixed)
+    #   End slope   = optimised to minimise ||j_ind + spike - eqdsk||²
+    edge_mask = psi_N >= shelf_psi
+    psi_edge = psi_N[edge_mask]
+    spike_edge = spike_profile[edge_mask]
+    eqdsk_edge = eqdsk_jphi[edge_mask]
+
+    m0_fixed = core_slope_est * interval  # scaled start slope (exact C1)
+
+    def _build_hermite_arr(m1_scaled):
+        """Build Hermite on edge grid with fixed m0."""
+        t = (psi_edge - shelf_psi) / interval
+        h00 = 2*t**3 - 3*t**2 + 1
+        h10 = t**3 - 2*t**2 + t
+        h01 = -2*t**3 + 3*t**2
+        h11 = t**3 - t**2
+        return h00 * val_at_shelf + h10 * m0_fixed + h01 * edge_target + h11 * m1_scaled
+
+    def _cost(m1_scaled):
+        bridge = np.maximum(_build_hermite_arr(m1_scaled), 0.0)
+        total = bridge + spike_edge
+        residual = total - eqdsk_edge
+        cost = np.mean(residual**2)
+        # Penalty for non-monotonic bridge
+        dbridge = np.diff(bridge)
+        violations = np.sum(np.maximum(dbridge, 0.0)**2)
+        return cost + 10.0 * violations
+
+    from scipy.optimize import minimize_scalar
+
+    res = minimize_scalar(
+        _cost, bounds=(-5.0 * val_at_shelf, 5.0 * val_at_shelf),
+        method='bounded',
+    )
+    m1_opt = res.x
+    m0_opt = m0_fixed
+
+    # Build final bridge on the full grid (inclusive of shelf_end index)
+    j_ind = j_ind_raw.copy()
+    for i in range(len(psi_N)):
+        if psi_N[i] >= shelf_psi:
+            t = (psi_N[i] - shelf_psi) / interval
+            t = min(t, 1.0)
+            h00 = 2*t**3 - 3*t**2 + 1
+            h10 = t**3 - 2*t**2 + t
+            h01 = -2*t**3 + 3*t**2
+            h11 = t**3 - t**2
+            j_ind[i] = (h00 * val_at_shelf + h10 * m0_opt
+                        + h01 * edge_target + h11 * m1_opt)
+
+    return np.maximum(j_ind, 0.0), shelf_psi
+
+
 # ---- Spline-based inductive profile fitting ----
 def fit_inductive_profile(mygs, eqdsk_jtor, j_BS_isolated, psi_N, psi_pad,
                             baseline_li_proxy,
@@ -119,9 +476,27 @@ def fit_inductive_profile(mygs, eqdsk_jtor, j_BS_isolated, psi_N, psi_pad,
     res_trusted = np.concatenate([residual[mask_core],
                                     [edge_target if rescale_j_BS else 0.0]])
 
-    spline = UnivariateSpline(psi_trusted, res_trusted, k=k,
-                                s=len(psi_trusted) * np.var(res_trusted) * 0.01)
-    j_inductive_basis = spline(psi_N)
+    # Use a smoothing spline followed by PCHIP to eliminate ringing.
+    # Step 1: smooth the residual with a generous smoothing factor
+    # to remove high-frequency noise while preserving the overall shape.
+    # Step 2: evaluate on a coarser grid and use PchipInterpolator
+    # (shape-preserving, monotonicity-respecting, C1) for the final
+    # profile on the full psi_N grid.
+    from scipy.interpolate import PchipInterpolator
+
+    _s_factor = len(psi_trusted) * np.var(res_trusted) * 0.1
+    _smooth_spline = UnivariateSpline(psi_trusted, res_trusted, k=k,
+                                       s=_s_factor)
+
+    # Subsample to ~32 points for PCHIP (enough to capture the shape,
+    # few enough to avoid oscillation)
+    _n_sub = min(32, len(psi_N))
+    _psi_sub = np.linspace(psi_N[0], psi_N[-1], _n_sub)
+    _res_sub = _smooth_spline(_psi_sub)
+    _res_sub = np.maximum(_res_sub, 0.0)
+
+    _pchip = PchipInterpolator(_psi_sub, _res_sub)
+    j_inductive_basis = _pchip(psi_N)
     j_inductive_basis = np.maximum(j_inductive_basis, 0.0)
 
     # ---- Helper: solve ind_scale for a given bs_scale via brentq ----
@@ -171,7 +546,7 @@ def fit_inductive_profile(mygs, eqdsk_jtor, j_BS_isolated, psi_N, psi_pad,
         'ind_scale': ind_scale,
         'bs_scale': bs_scale_out,
         'j_BS_used': j_BS_work,
-        'spline': spline,
+        'spline': _pchip,
     }
 
 # ====================================================================
@@ -552,30 +927,26 @@ def perturb_kinetic_equilibrium(
         j0_scales.append(final_scale_j0)
         Ip_scales.append(final_scale_Ip)
 
-        # ---- 5e. Final GS solves (2 iterations for convergence) -----
-        for _ in range(2):
-            pprime_tmp = np.gradient(pres_tmp) / (
-                np.gradient(psi_N) * psi_range
-            )
-            pprime_tmp[-1] = 0.0
+        # ---- 5e. Adaptive corrective iteration ----------------------
+        # Iterate TokaMaker until its output j_phi matches the intended
+        # input (j_inductive*scale + spike).  This compensates for
+        # geometry coupling that distorts the edge profile.
+        pprime_tmp = np.gradient(pres_tmp) / (
+            np.gradient(psi_N) * psi_range
+        )
+        pprime_tmp[-1] = 0.0
+        pp_prof = {"type": "linterp", "y": pprime_tmp, "x": psi_N}
 
-            mygs.set_targets(Ip=Ip_target * final_scale_Ip, pax=pres_tmp[0])
+        target_jphi_perturb = matched_j_inductive * final_scale_j0 + spike_profile
 
-            pp_prof = {"type": "linterp", "y": pprime_tmp, "x": psi_N}
-            ffp_prof = {
-                "type": "jphi-linterp",
-                "y": matched_j_inductive * final_scale_j0 + spike_profile,
-                "x": psi_N,
-            }
-            mygs.set_profiles(pp_prof=pp_prof, ffp_prof=ffp_prof)
-            mygs.solve()
-
-        # ---- 5f. Evaluate converged equilibrium ---------------------
-        _, f, fp, p, pp = mygs.get_profiles(npsi=npsi, psi_pad=psi_pad)
-        _, q, ravgs, _, _, _ = mygs.get_q(npsi=npsi, psi_pad=psi_pad)
-        R_avg = ravgs[0]
-        one_over_R_avg = ravgs[1]
-        output_jphi = get_jphi_from_GS(f * fp, pp, R_avg, one_over_R_avg)
+        output_jphi, _n_corr, _corr_hist = _corrective_jphi_iteration(
+            mygs, psi_N, target_jphi_perturb, pp_prof,
+            Ip_target * final_scale_Ip, pres_tmp[0], psi_pad,
+            min_iters=2, max_iters=8, rtol=0.05, verbose=False,
+        )
+        if _n_corr > 2:
+            print(f"  [jphi correction] {_n_corr} iterations, "
+                  f"edge RMS: {_corr_hist[0]/1e6:.4f} → {_corr_hist[-1]/1e6:.4f} MA/m²")
 
         if diagnostic_plots:
             fig, ax = plt.subplots(figsize=(5, 4))
@@ -647,12 +1018,18 @@ def perturb_kinetic_equilibrium(
     # output tuple and HDF5 schema remain forward-compatible.
     w_ExB = np.zeros_like(psi_N)
 
+    # Shelf-blend decomposition: j_inductive tapers to zero at the
+    # edge where the Sauter spike dominates.
+    j_inductive_consistent, _ = _shelf_blend_decompose(
+        psi_N, output_jphi, spike_profile, eqdsk_jphi=input_j_phi
+    )
+
     diagnostics = {
         "j0_scales": j0_scales,
         "Ip_scales": Ip_scales,
         "iteration_l_is": iteration_l_is,
         "iteration_Ips": iteration_Ips,
-        "j_inductive": matched_j_inductive * final_scale_j0,
+        "j_inductive": j_inductive_consistent,
         "j_BS": full_j_BS,
         "j_BS_edge": spike_profile,
     }
@@ -790,11 +1167,28 @@ def generate_bouquet(
     """
     all_diagnostics = []
 
+    # self-consistent pressure for baseline <P>
+    pressure = EC * (ne * te + ni * ti)
+    npsi = len(pressure)
+
     # --- Auto-override constrain_sawteeth for sawtoothing baselines ---
     # If the baseline equilibrium already has q_0 < 1, constraining
     # perturbed equilibria to q_0 >= 1 is incompatible and will cause
     # every candidate to be rejected.  Detect this and override.
+    # Re-solve with the baseline profiles first so the check reflects
+    # the reconstruction state (not a corrective-iteration state that
+    # may have altered q_0).
     if constrain_sawteeth:
+        _pp_check = {"type": "linterp",
+                      "y": np.gradient(pressure) / (np.gradient(psi_N)
+                           * (mygs.psi_bounds[1] - mygs.psi_bounds[0])),
+                      "x": psi_N}
+        _pp_check["y"][-1] = 0.0
+        _ffp_check = {"type": "jphi-linterp",
+                       "y": input_j_phi.copy(), "x": psi_N}
+        mygs.set_targets(Ip=initial_Ip_target, pax=pressure[0])
+        mygs.set_profiles(pp_prof=_pp_check, ffp_prof=_ffp_check)
+        mygs.solve()
         _, q_baseline_check, _, _, _, _ = mygs.get_q(
             npsi=len(psi_N), psi_pad=psi_pad
         )
@@ -806,10 +1200,6 @@ def generate_bouquet(
                 f"equilibria are not rejected."
             )
             constrain_sawteeth = False
-
-    # self-consistent pressure for baseline <P>
-    pressure = EC * (ne * te + ni * ti)
-    npsi = len(pressure)
 
     # Pre-compute jBS scale factors for the whole batch (if requested).
     # Uses a uniform distribution within the specified range so that
@@ -1193,6 +1583,16 @@ def reconstruct_equilibrium(mygs, eqdsk, ne, te, ni, ti, Zeff,
 
     j_BS_isolated = results['isolated_j_BS']
 
+    # ---- 2b. Classify the j_phi profile ----
+    jphi_mode, spike_metrics = classify_jphi_profile(
+        eqdsk.psi_N, eqdsk_jtor, j_BS_isolated
+    )
+
+    # Pre-compute shelf location (needed for mode-dependent iteration)
+    _, _shelf_psi_recon = _shelf_blend_decompose(
+        eqdsk.psi_N, eqdsk_jtor, j_BS_isolated, eqdsk_jphi=eqdsk_jtor
+    )  # just to get shelf_psi; j_ind result discarded
+
     # ---- 3. Fit inductive profile ----
     baseline_li_proxy = calc_cylindrical_li_proxy(mygs, eqdsk_jtor, psi_pad)
 
@@ -1204,13 +1604,67 @@ def reconstruct_equilibrium(mygs, eqdsk, ne, te, ni, ti, Zeff,
         shelf_psi_N=shelf_psi_N,
     )
 
-    j_inductive_fit = fit_result['j_inductive_fit']
+    j_inductive_fit_raw = fit_result['j_inductive_fit']
     scale_opt = fit_result['ind_scale']
     bs_scale_opt = fit_result['bs_scale']
     j_BS_isolated = fit_result['j_BS_used']
 
     print(f"[fit] ind_scale={scale_opt:.6f}  bs_scale={bs_scale_opt:.6f}  "
           f"li_proxy={fit_result['fit_li']:.6f}  (target={baseline_li_proxy:.6f})")
+
+    # Smooth the shelf→spike transition in j_BS_isolated to eliminate
+    # second-derivative discontinuities that TokaMaker's geometry
+    # coupling amplifies into visible divots in the output j_phi.
+    # Apply a localised Gaussian filter only around the transition zone.
+    from scipy.ndimage import gaussian_filter1d
+
+    _shelf_val_sm = j_BS_isolated[0]
+    _shelf_end_sm = 0
+    for _i in range(1, len(j_BS_isolated)):
+        if abs(j_BS_isolated[_i] - _shelf_val_sm) / max(abs(_shelf_val_sm), 1e-30) < 1e-6:
+            _shelf_end_sm = _i
+        else:
+            break
+
+    # Smooth a window around the shelf end (±10 indices)
+    _sm_half = 10
+    _sm_lo = max(0, _shelf_end_sm - _sm_half)
+    _sm_hi = min(len(j_BS_isolated), _shelf_end_sm + _sm_half + 1)
+    _sm_sigma = 3.0  # Gaussian width in grid indices
+
+    _smoothed_section = gaussian_filter1d(j_BS_isolated[_sm_lo:_sm_hi], sigma=_sm_sigma)
+
+    # Blend smoothed section back — only modify the transition zone,
+    # preserve the exact shelf value in the core and exact spike beyond
+    j_BS_isolated_smooth = j_BS_isolated.copy()
+    for _i in range(_sm_lo, _sm_hi):
+        _local = _i - _sm_lo
+        # Blend weight: 1 at shelf_end, 0 at edges of window
+        _dist = abs(_i - _shelf_end_sm) / _sm_half
+        _w = max(0.0, 1.0 - _dist)  # triangular window
+        j_BS_isolated_smooth[_i] = (_w * _smoothed_section[_local]
+                                     + (1 - _w) * j_BS_isolated[_i])
+
+    j_BS_isolated = j_BS_isolated_smooth
+
+    # Use the spline-fit j_inductive directly. The corrective iteration
+    # (section 7) will drive TokaMaker's output to match the target
+    # j_phi = j_inductive_fit + j_BS_isolated, compensating for any
+    # geometry-coupling distortion at the edge.
+    j_inductive_fit = j_inductive_fit_raw
+
+    # DEBUG: check spline fit for divot before corrective iteration
+    _d2_max = 0
+    _d2_idx = 0
+    for _di in range(1, len(eqdsk.psi_N) - 1):
+        _s1 = (j_inductive_fit[_di] - j_inductive_fit[_di-1]) / (eqdsk.psi_N[_di] - eqdsk.psi_N[_di-1])
+        _s2 = (j_inductive_fit[_di+1] - j_inductive_fit[_di]) / (eqdsk.psi_N[_di+1] - eqdsk.psi_N[_di])
+        _d2 = abs(_s2 - _s1) / 1e6
+        if _d2 > _d2_max:
+            _d2_max = _d2
+            _d2_idx = _di
+    print(f"[spline_check] max |d²j_ind/dpsi²| = {_d2_max:.4f} MA/m²/psiN² "
+          f"at index {_d2_idx} (psi_N={eqdsk.psi_N[_d2_idx]:.5f})")
 
     # ---- 4. Pressure and GS profiles ----
     pres_tmp = 1.6022e-19 * (ne * te + ni * ti)
@@ -1474,10 +1928,101 @@ def reconstruct_equilibrium(mygs, eqdsk, ne, te, ni, ti, Zeff,
           f"Ip_err={100 * (Ip_tokamaker - Ip_desired) / Ip_desired:+.4f}%  "
           f"li_err={abs(final_li - li_target):.6f}")
 
-    # Final profiles (unchanged from li matching — Ip corrected via set_targets)
-    j_ind_final = j_ind_li.copy()
-    j_BS_final = j_BS_isolated.copy()
-    j_phi_final = j_phi_li.copy()
+    # ---- 7. Mode-dependent corrective iteration ----
+    #
+    # TokaMaker's jphi-linterp converts j_phi to FF' using flux-surface
+    # geometry (<R>, <1/R>).  The output j_phi generally differs from
+    # the input because the geometry changes after solving.  Iterate
+    # the input to drive the output toward the geqdsk target.
+    #
+    # For Lmode_like_jphi: only correct in the core (psi_N < shelf),
+    # preserving the Sauter edge spike that the geqdsk lacks.
+    Ip_final_target = abs(eqdsk.Ip)
+
+    if jphi_mode == 'L_mode':
+        # TODO: validate with L-mode test data
+        j_BS_isolated_corr = np.zeros_like(eqdsk.psi_N)
+        corr_target = eqdsk_jtor.copy()
+        print("[reconstruct] L_mode: zeroing j_BS_isolated, using geqdsk j_phi as j_inductive")
+    else:
+        # H_mode and Lmode_like_jphi: target = j_inductive_fit + j_BS_isolated.
+        # Always trust the Sauter edge spike rather than the geqdsk edge.
+        # The spline fit already matches the geqdsk in the core
+        # (since it fits eqdsk - j_BS), so no blend with eqdsk_jtor
+        # is needed — avoiding blend-induced kinks and preserving
+        # the Sauter edge structure.
+        corr_target = (j_ind_li + j_BS_isolated).copy()
+        j_BS_isolated_corr = j_BS_isolated.copy()
+
+    # Adaptive corrective iteration
+    j_phi_output_corr, _n_corr, _corr_hist = _corrective_jphi_iteration(
+        mygs, eqdsk.psi_N, corr_target, pp_prof,
+        Ip_final_target, pres_tmp[0], psi_pad,
+        min_iters=2, max_iters=8, rtol=0.05, verbose=True,
+    )
+
+    # ---- 8. Final profiles ----
+    # The corrective iteration drove TokaMaker's output toward
+    # corr_target (= Hermite-bridged j_inductive + j_BS in the edge,
+    # geqdsk in the core).  The output j_phi_output_corr is smooth
+    # and self-consistent.  Decompose by simple subtraction — no
+    # re-running the Hermite bridge, which would create a different
+    # optimisation and introduce kinks.
+    j_phi_final = j_phi_output_corr.copy()
+    j_BS_final = j_BS_isolated_corr.copy()
+
+    if jphi_mode == 'L_mode':
+        # TODO: validate with L-mode test data
+        j_ind_final = j_phi_final.copy()
+        j_BS_final = np.zeros_like(j_phi_final)
+    else:
+        j_ind_final = j_phi_final - j_BS_final
+        j_ind_final = np.maximum(j_ind_final, 0.0)
+
+    # ---- 9. Reconstruction quality metrics ----
+    _edge_mask = eqdsk.psi_N > 0.9
+    _core_mask = eqdsk.psi_N < 0.8
+
+    # Boundary deviation: nearest-neighbor distance from geqdsk boundary
+    # points to the TokaMaker LCFS contour (same method as plotting.py)
+    from scipy.spatial import cKDTree as _cKDTree_q
+    _psi_arr = mygs.get_psi(False)
+    _psi_lcfs = float(mygs.psi_bounds[0])
+    _fig_tmp, _ax_tmp = plt.subplots(1, 1)
+    try:
+        _cs = _ax_tmp.tricontour(
+            mygs.r[:, 0], mygs.r[:, 1], mygs.lc, _psi_arr,
+            levels=[_psi_lcfs])
+        _segs = [v for seg in _cs.allsegs for v in seg if len(v) > 4]
+    finally:
+        plt.close(_fig_tmp)
+
+    if _segs:
+        _lcfs_pts = max(_segs, key=len)
+        _tree = _cKDTree_q(_lcfs_pts)
+        _devs, _ = _tree.query(isoflux_pts)
+        _bnd_rms_mm = float(np.sqrt(np.mean(_devs**2)) * 1e3)
+        _bnd_max_mm = float(np.max(_devs) * 1e3)
+    else:
+        _bnd_rms_mm = float('nan')
+        _bnd_max_mm = float('nan')
+
+    quality = {
+        'jphi_mode': jphi_mode,
+        **spike_metrics,
+        'jphi_core_rms': float(np.sqrt(np.mean(
+            (j_phi_final[_core_mask] - eqdsk_jtor[_core_mask])**2))),
+        'jphi_edge_rms': float(np.sqrt(np.mean(
+            (j_phi_final[_edge_mask] - eqdsk_jtor[_edge_mask])**2))),
+        'li_error': float(abs(final_li - li_target)),
+        'Ip_error_pct': float(100 * abs(Ip_tokamaker - Ip_desired) / Ip_desired),
+        'boundary_rms_mm': _bnd_rms_mm,
+        'boundary_max_dev_mm': _bnd_max_mm,
+    }
+    print(f"[quality] mode={jphi_mode}, core_rms={quality['jphi_core_rms']/1e6:.4f} MA/m², "
+          f"edge_rms={quality['jphi_edge_rms']/1e6:.4f} MA/m², "
+          f"li_err={quality['li_error']:.6f}, Ip_err={quality['Ip_error_pct']:.4f}%, "
+          f"bnd_rms={_bnd_rms_mm:.2f} mm, bnd_max={_bnd_max_mm:.2f} mm")
 
     # FF' from the converged TokaMaker equilibrium
     _, F_prof, Fp_prof, _, _ = mygs.get_profiles(psi=eqdsk.psi_N)
@@ -1512,4 +2057,5 @@ def reconstruct_equilibrium(mygs, eqdsk, ne, te, ni, ti, Zeff,
         'pres_tokamaker': pres_tmp.copy(),
         'psi_N_grid': eqdsk.psi_N.copy(),
         'li_final': final_li,
+        'quality': quality,
     }

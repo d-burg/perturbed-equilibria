@@ -238,7 +238,7 @@ def _write_geqdsk_to_stream(g, stream):
     # Header
     case_arr = g.get("CASE", np.array([" " * 8] * 6))
     case_str = "".join(c.ljust(8)[:8] for c in case_arr)[:48]
-    stream.write(f"{case_str}   0 {NW:4d} {NH:4d}\n")
+    stream.write(f"{case_str}{0:4d}{NW:4d}{NH:4d}\n")
 
     # 20 scalars
     scalars = [

@@ -19,6 +19,7 @@ from .sampling import (
 )
 
 from .TokaMaker_interface import (
+    classify_jphi_profile,
     fit_inductive_profile,
     perturb_kinetic_equilibrium,
     generate_bouquet,
