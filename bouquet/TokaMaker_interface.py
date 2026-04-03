@@ -590,6 +590,7 @@ def perturb_kinetic_equilibrium(
     diagnostic_plots=False,
     max_pressure_iter=_MAX_PRESSURE_ITER,
     max_li_iter=_MAX_LI_ITER,
+    psi_N_kinetic=None,
 ):
     r"""Perturb kinetic and current-density profiles and iterate to
     match :math:`I_p` and :math:`l_i` targets.
@@ -666,18 +667,30 @@ def perturb_kinetic_equilibrium(
         Safety cap on pressure-matching loop.
     max_li_iter : int
         Safety cap on :math:`l_i`-matching loop.
+    psi_N_kinetic : ndarray or None
+        Kinetic-profile grid (may extend past psi_N = 1 into the SOL).
+        If provided, ``ne``, ``te``, ``ni``, ``ti`` and their sigmas
+        must be on this grid.  GPR sampling is done on this grid;
+        perturbed profiles are then interpolated onto ``psi_N`` for
+        pressure matching and equilibrium solving.  Returned
+        perturbed profiles are on ``psi_N_kinetic``.  If ``None``,
+        ``psi_N`` is used for everything (original behaviour).
 
     Returns
     -------
     tuple
         ``(ne_perturb, te_perturb, ni_perturb, ti_perturb,
         w_ExB, output_jphi, diagnostics)``
+
+        When ``psi_N_kinetic`` is provided, the kinetic profiles
+        (``ne_perturb`` etc.) are on the ``psi_N_kinetic`` grid.
     """
 
     # ----------------------------------------------------------------
     #  1.  Lazy OFT imports (deferred so GPR-only use works without OFT)
     # ----------------------------------------------------------------
     from scipy.optimize import root_scalar
+    from scipy.interpolate import interp1d
     from OpenFUSIONToolkit.TokaMaker.util import get_jphi_from_GS
     from OpenFUSIONToolkit.TokaMaker.bootstrap import (
         solve_with_bootstrap,
@@ -685,12 +698,24 @@ def perturb_kinetic_equilibrium(
     )
 
     # ----------------------------------------------------------------
-    #  2.  Validate inputs
+    #  2.  Validate inputs and set up dual grids
     # ----------------------------------------------------------------
     if recalculate_j_BS and input_jinductive is None:
         raise ValueError(
             "input_jinductive must be provided when recalculate_j_BS=True"
         )
+
+    # Kinetic grid: either the user-supplied extended grid or psi_N
+    psi_kin = psi_N_kinetic if psi_N_kinetic is not None else psi_N
+    _dual_grid = psi_N_kinetic is not None
+
+    def _kin_to_eq(arr_kin):
+        """Interpolate a profile from kinetic grid onto equilibrium grid."""
+        if not _dual_grid:
+            return arr_kin
+        return interp1d(psi_kin, arr_kin, kind='linear',
+                        bounds_error=False,
+                        fill_value=(arr_kin[0], arr_kin[-1]))(psi_N)
 
     # ----------------------------------------------------------------
     #  3.  Perturb kinetic profiles to match <P>
@@ -709,26 +734,30 @@ def perturb_kinetic_equilibrium(
                 f"(last error {p_err:.2f}% vs threshold {p_thresh}%)"
             )
 
-        # Each profile gets its own σ, converted to normalised-profile units
+        # GPR sampling on psi_kin (kinetic grid, may include SOL)
         ne_perturb = _draw_monotonic_perturbation(
-            psi_N, ne / ne[0], sigma_ne / ne[0], n_ls
+            psi_kin, ne / ne[0], sigma_ne / ne[0], n_ls
         ) * ne[0]
 
         te_perturb = _draw_monotonic_perturbation(
-            psi_N, te / te[0], sigma_te / te[0], t_ls
+            psi_kin, te / te[0], sigma_te / te[0], t_ls
         ) * te[0]
 
         ni_perturb = _draw_monotonic_perturbation(
-            psi_N, ni / ni[0], sigma_ni / ni[0], n_ls
+            psi_kin, ni / ni[0], sigma_ni / ni[0], n_ls
         ) * ni[0]
 
         ti_perturb = _draw_monotonic_perturbation(
-            psi_N, ti / ti[0], sigma_ti / ti[0], t_ls
+            psi_kin, ti / ti[0], sigma_ti / ti[0], t_ls
         ) * ti[0]
 
-        pres_tmp = EC * (
-            ne_perturb * te_perturb + ni_perturb * ti_perturb
-        )
+        # Pressure matching on equilibrium grid (psi_N, confined only)
+        ne_eq = _kin_to_eq(ne_perturb)
+        te_eq = _kin_to_eq(te_perturb)
+        ni_eq = _kin_to_eq(ni_perturb)
+        ti_eq = _kin_to_eq(ti_perturb)
+
+        pres_tmp = EC * (ne_eq * te_eq + ni_eq * ti_eq)
         tmp_avg = mygs.flux_integral(psi_N, pres_tmp)
         p_err = np.mean(np.abs(inp_avg - tmp_avg) / inp_avg) * 100.0
 
@@ -779,7 +808,7 @@ def perturb_kinetic_equilibrium(
         # figure produced later in the l_i loop.
         results = solve_with_bootstrap(
             mygs,
-            ne_perturb, te_perturb, ni_perturb, ti_perturb,
+            ne_eq, te_eq, ni_eq, ti_eq,
             Zeff, Ip_target, input_jinductive,
             scale_jBS=scale_jBS,
             isolate_edge_jBS=isolate_edge_jBS,
@@ -1088,6 +1117,7 @@ def generate_bouquet(
     Zeff_profile=None,
     baseline_eqdsk_bytes=None,
     baseline_pfile_bytes=None,
+    psi_N_kinetic=None,
 ):
     r"""Generate a batch of perturbed equilibria and archive to HDF5.
 
@@ -1173,8 +1203,17 @@ def generate_bouquet(
     all_diagnostics = []
 
     # self-consistent pressure for baseline <P>
-    pressure = EC * (ne * te + ni * ti)
-    npsi = len(pressure)
+    # When kinetic profiles are on a different grid, interpolate
+    # onto the equilibrium grid for pressure/GS calculations.
+    if psi_N_kinetic is not None:
+        from scipy.interpolate import interp1d as _interp1d_bg
+        _kin2eq = lambda arr: _interp1d_bg(
+            psi_N_kinetic, arr, kind='linear', bounds_error=False,
+            fill_value=(arr[0], arr[-1]))(psi_N)
+        pressure = EC * (_kin2eq(ne) * _kin2eq(te) + _kin2eq(ni) * _kin2eq(ti))
+    else:
+        pressure = EC * (ne * te + ni * ti)
+    npsi = len(psi_N)
 
     # --- Auto-override constrain_sawteeth for sawtoothing baselines ---
     # If the baseline equilibrium already has q_0 < 1, constraining
@@ -1332,6 +1371,7 @@ def generate_bouquet(
                 isolate_edge_jBS=isolate_edge_jBS,
                 scale_jBS=scale_jBS,
                 diagnostic_plots=diagnostic_plots,
+                psi_N_kinetic=psi_N_kinetic,
             )
         except (RuntimeError, ValueError) as e:
             print(f"\n  STOPPED: {e}")
@@ -1393,7 +1433,13 @@ def generate_bouquet(
 
                 pf = _PFile.from_bytes(pfile_bytes)
 
-                # Interpolate SI profiles → p-file grid & units
+                # Interpolate perturbed profiles → p-file grid.
+                # When psi_N_kinetic is provided, the perturbed
+                # profiles already cover the SOL — no extrapolation
+                # needed.  Otherwise, fall back to the equilibrium
+                # grid with edge-value fill (no cubic extrapolation).
+                _psi_src = (psi_N_kinetic if psi_N_kinetic is not None
+                            else psi_N)
                 for pf_key, arr_si, scale in [
                     ("ne", ne_perturb, 1e-20),   # m^-3 → 10^20/m^3
                     ("te", te_perturb, 1e-3),     # eV   → keV
@@ -1403,9 +1449,11 @@ def generate_bouquet(
                     if pf_key in pf:
                         psi_grid = pf.psinorm_for(pf_key)
                         vals = interp1d(
-                            psi_N, arr_si * scale,
+                            _psi_src, arr_si * scale,
                             kind="cubic",
-                            fill_value="extrapolate",
+                            bounds_error=False,
+                            fill_value=(arr_si[0] * scale,
+                                        arr_si[-1] * scale),
                         )(psi_grid)
                         pf.set_profile(pf_key, psi_grid, vals)
 
