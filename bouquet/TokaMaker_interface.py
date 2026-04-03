@@ -98,7 +98,12 @@ def _corrective_jphi_iteration(mygs, psi_N, target_jphi, pp_prof,
         ffp = {"type": "jphi-linterp", "y": j_phi_input.copy(), "x": psi_N}
         mygs.set_targets(Ip=Ip_target, pax=pax_target)
         mygs.set_profiles(pp_prof=pp_prof, ffp_prof=ffp)
-        mygs.solve()
+        try:
+            mygs.solve()
+        except (ValueError, RuntimeError) as e:
+            if verbose:
+                print(f"  [jphi_corr iter {it+1}] solve failed: {e}")
+            break
 
         _, f, fp, _, pp = mygs.get_profiles(npsi=npsi, psi_pad=psi_pad)
         _, _, ravgs, _, _, _ = mygs.get_q(npsi=npsi, psi_pad=psi_pad)
@@ -1328,7 +1333,7 @@ def generate_bouquet(
                 scale_jBS=scale_jBS,
                 diagnostic_plots=diagnostic_plots,
             )
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             print(f"\n  STOPPED: {e}")
             print(f"  Skipping equilibrium {count+1}/{n_equils}.\n")
             if pbar is not None:
