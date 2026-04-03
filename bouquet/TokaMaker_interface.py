@@ -1393,12 +1393,7 @@ def generate_bouquet(
 
                 pf = _PFile.from_bytes(pfile_bytes)
 
-                # Interpolate SI profiles → p-file grid & units.
-                # Only replace the confined region (psi_N <= 1);
-                # preserve baseline p-file values in the SOL
-                # (psi_N > 1) where the perturbed profiles have no
-                # meaningful data and cubic extrapolation would
-                # produce wild values.
+                # Interpolate SI profiles → p-file grid & units
                 for pf_key, arr_si, scale in [
                     ("ne", ne_perturb, 1e-20),   # m^-3 → 10^20/m^3
                     ("te", te_perturb, 1e-3),     # eV   → keV
@@ -1407,15 +1402,11 @@ def generate_bouquet(
                 ]:
                     if pf_key in pf:
                         psi_grid = pf.psinorm_for(pf_key)
-                        baseline_vals = pf[pf_key]['data'].copy()
-                        confined = psi_grid <= 1.0
-                        vals = baseline_vals.copy()
-                        vals[confined] = interp1d(
+                        vals = interp1d(
                             psi_N, arr_si * scale,
                             kind="cubic",
-                            bounds_error=False,
-                            fill_value=(arr_si[0] * scale, arr_si[-1] * scale),
-                        )(psi_grid[confined])
+                            fill_value="extrapolate",
+                        )(psi_grid)
                         pf.set_profile(pf_key, psi_grid, vals)
 
                 # Keep baseline nz1 rather than recomputing from
