@@ -510,7 +510,7 @@ def draw_kinetic_profiles(axes, psi_N, ne, ni, te, ti,
     for a, orig, scale, sig, clr, lbl, ylabel in _pairs:
         a.cla()
         a.plot(psi_N, orig * scale, c="k", lw=2,
-               label=f"input {lbl}", zorder=3)
+               label=f"input {lbl}", zorder=1)
         a.fill_between(
             psi_N,
             (orig - sig) * scale,
@@ -520,9 +520,9 @@ def draw_kinetic_profiles(axes, psi_N, ne, ni, te, ti,
         )
         a.plot(psi_N, (orig + 2 * sig) * scale, c="k", ls=":",
                lw=1.5, alpha=0.5, label=r"$\pm\,2\sigma_{\rm exp}$",
-               zorder=2)
+               zorder=1)
         a.plot(psi_N, (orig - 2 * sig) * scale, c="k", ls=":",
-               lw=1.5, alpha=0.5, zorder=2)
+               lw=1.5, alpha=0.5, zorder=1)
         a.grid(ls=":")
         if ylabel:
             a.set_ylabel(ylabel)
@@ -537,9 +537,9 @@ def draw_kinetic_profiles(axes, psi_N, ne, ni, te, ti,
             ):
                 a.plot(
                     _psi_pert, data[key] * scale,
-                    c=clr, alpha=0.9, lw=1.5,
+                    c=clr, alpha=0.65, lw=1.5,
                     label=f"perturbed ({n_equils})" if i == 0 else None,
-                    zorder=2,
+                    zorder=3,
                 )
 
     # ---- legends and axis labels -----------------------------------------
@@ -564,7 +564,7 @@ def draw_pressure_profiles(ax, psi_N, pressure, perturbed_data_list=None):
     _kPa = 1e-3
     ax.cla()
     ax.plot(psi_N, pressure * _kPa, c="k", lw=2,
-            label="input pressure", zorder=3)
+            label="input pressure", zorder=1)
     ax.grid(ls=":")
     ax.set_xlabel(r"$\hat{\psi}$")
     ax.set_ylabel("Pressure [kPa]")
@@ -575,9 +575,9 @@ def draw_pressure_profiles(ax, psi_N, pressure, perturbed_data_list=None):
             if "pressure [Pa]" in data:
                 ax.plot(
                     psi_N, data["pressure [Pa]"] * _kPa,
-                    c="tab:brown", alpha=0.9, lw=1.5,
+                    c="tab:brown", alpha=0.65, lw=1.5,
                     label=f"perturbed ({n_equils})" if i == 0 else None,
-                    zorder=2,
+                    zorder=3,
                 )
 
     ax.legend(loc="best", fontsize=8)
@@ -601,7 +601,7 @@ def draw_jphi_total(ax, psi_N, j_phi, sigma_jphi,
 
     ax.cla()
     ax.plot(psi_N, j_phi * _MA, c="k", lw=2,
-            label=r"input $j_\phi$", zorder=4)
+            label=r"input $j_\phi$", zorder=1)
     ax.fill_between(
         psi_N,
         (j_phi - sigma_jphi) * _MA,
@@ -610,9 +610,9 @@ def draw_jphi_total(ax, psi_N, j_phi, sigma_jphi,
         label=r"$\pm\,1\sigma_{\rm exp}$", zorder=1,
     )
     ax.plot(psi_N, (j_phi + 2 * sigma_jphi) * _MA, c="k", ls=":", lw=1.5,
-            alpha=0.5, label=r"$\pm\,2\sigma_{\rm exp}$", zorder=2)
+            alpha=0.5, label=r"$\pm\,2\sigma_{\rm exp}$", zorder=1)
     ax.plot(psi_N, (j_phi - 2 * sigma_jphi) * _MA, c="k", ls=":", lw=1.5,
-            alpha=0.5, zorder=2)
+            alpha=0.5, zorder=1)
     ax.set_ylabel(r"$j_\phi$ [MA/m$^2$]")
     ax.set_xlabel(r"$\hat{\psi}$")
     ax.grid(ls=":")
@@ -621,7 +621,7 @@ def draw_jphi_total(ax, psi_N, j_phi, sigma_jphi,
         n_equils = len(perturbed_data_list)
         for i, data in enumerate(perturbed_data_list):
             ax.plot(psi_N, data["j_phi [A m^-2]"] * _MA, c="tab:purple",
-                    lw=1.5, alpha=0.9,
+                    lw=1.5, alpha=0.65,
                     label=f"perturbed ({n_equils})" if i == 0 else None,
                     zorder=3)
 
@@ -663,21 +663,21 @@ def draw_jphi_components(axes, psi_N, perturbed_data_list=None):
             # reference: total j_phi on both panels
             for ax, *_ in _sub:
                 ax.plot(psi_N, data["j_phi [A m^-2]"] * _MA,
-                        c="k", ls="--", lw=1.2, alpha=0.5,
+                        c="k", ls="--", lw=1.2, alpha=0.4,
                         label=r"$j_\phi$ (total)" if i == 0 else None,
-                        zorder=2)
+                        zorder=1)
 
             # component curves
             for ax, key, label, color in _sub:
                 if key in data:
                     ax.plot(psi_N, data[key] * _MA, c=color, lw=1.5,
-                            alpha=0.9, label=lbl, zorder=3)
+                            alpha=0.65, label=lbl, zorder=3)
 
             # j_BS,edge overlay on the j_BS panel
             if "j_BS,edge [A m^-2]" in data:
                 axes[0].plot(
                     psi_N, data["j_BS,edge [A m^-2]"] * _MA,
-                    c="tab:red", ls="--", lw=1.5, alpha=0.8,
+                    c="tab:red", ls="--", lw=1.5, alpha=0.55,
                     label=r"$j_{\rm BS,edge}$" if i == 0 else None,
                     zorder=4,
                 )
