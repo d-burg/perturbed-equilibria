@@ -1422,8 +1422,18 @@ def generate_bouquet(
         eq_stats_iter = mygs.get_stats(li_normalization="iter", lcfs_pad=psi_pad)
         li3 = eq_stats_iter["l_i"]
 
-        # Pressure on the equilibrium grid (for storage and plotting)
-        pressure_perturb = EC * (ne_eq * te_eq + ni_eq * ti_eq)
+        # Pressure on the equilibrium grid (for storage and plotting).
+        # Interpolate kinetic profiles onto psi_N if on a different grid.
+        if psi_N_kinetic is not None:
+            from scipy.interpolate import interp1d as _interp1d_pp
+            _to_eq = lambda arr: _interp1d_pp(
+                psi_N_kinetic, arr, kind='linear', bounds_error=False,
+                fill_value=(arr[0], arr[-1]))(psi_N)
+            pressure_perturb = EC * (_to_eq(ne_perturb) * _to_eq(te_perturb)
+                                      + _to_eq(ni_perturb) * _to_eq(ti_perturb))
+        else:
+            pressure_perturb = EC * (ne_perturb * te_perturb
+                                      + ni_perturb * ti_perturb)
 
         # Extract coil currents from TokaMaker
         coil_current_dict, _ = mygs.get_coil_currents()
