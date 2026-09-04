@@ -699,6 +699,44 @@ def close_ip(channel, Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
     return scales
 
 
+def unrenormalise_q0(q0_anchor, j_achieved0, j_requested0):
+    r"""The anchor's q0 mapped back onto the source's OWN current.
+
+    ``solve_jphi`` hands TokaMaker a jphi-linterp *shape* and TokaMaker
+    renormalises it to ``Ip_target``.  When the source's total does not itself
+    carry Ip (FUSE's ``core_profiles`` total reads -3.89 % on the 148798
+    reference slice) the anchor equilibrium therefore sits at a current the
+    source never claimed, and its ``q0`` with it.  Undo that to the same first
+    order the whole predictor runs on -- ``q0 ~ 1/j_phi(0)`` at frozen
+    geometry:
+
+    .. math:: q_{0,\mathrm{target}} = q_{0,\mathrm{anchor}}
+              \; j_{\mathrm{achieved}}(0) / j_{\mathrm{requested}}(0)
+
+    where *j_achieved0* is the anchor's GS-reconstructed own axis current
+    (:func:`eq_jphi_profile`, which round-trips to its achieved Ip) and
+    *j_requested0* the source total at the same psi_pad-clipped axis sample.
+
+    A named function rather than three inline characters because this is the
+    one place the Ip-deficit artefact is deliberately NOT propagated into the
+    current split: every other channel absorbs that deficit into a single
+    scale and leaves the shape alone, and this keeps the q0 channel consistent
+    with them.  Raises ``RuntimeError`` on a zero or non-finite requested axis
+    current, where the ratio is meaningless.
+    """
+    q0_anchor = float(q0_anchor)
+    j_a, j_r = float(j_achieved0), float(j_requested0)
+    if not (np.isfinite(q0_anchor) and np.isfinite(j_a) and np.isfinite(j_r)):
+        raise RuntimeError("unrenormalise_q0: non-finite input "
+                           f"(q0_anchor={q0_anchor!r}, j_achieved0={j_a!r}, "
+                           f"j_requested0={j_r!r})")
+    if j_r == 0.0:
+        raise RuntimeError("unrenormalise_q0: the source total has zero axis "
+                           "current density; q0 cannot be un-renormalised "
+                           "onto it")
+    return q0_anchor * (j_a / j_r)
+
+
 def close_ip_q0(Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
                 j_ind0, j_bs0, j_fix0, j_ref0,
                 scale_bounds=(0.2, 5.0), det_rtol=1e-6):

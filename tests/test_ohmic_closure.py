@@ -228,10 +228,11 @@ class TestSawtoothBootstrapPredictor:
         assert closed == pytest.approx(Ip_t, rel=1e-12)
 
     def test_reduces_to_bootstrap_when_the_bootstrap_has_no_core(self):
-        """The plan's central prediction: with j_BS(0) = 0 the axis row pins
-        s_ohm to the ratio of axis currents (1 when the source's own axis
-        current is reproduced) and the Ip row hands the whole deficit to
-        s_bs -- i.e. exactly close_ip('bootstrap'), at zero extra cost."""
+        """The plan's central prediction, and what the REQUESTED reference
+        makes the common case: the target axis current is the source's own
+        (j_ind0 + j_BS_src0 + j_fix0), so with no core bootstrap on either
+        side the axis row pins s_ohm = 1 exactly and the Ip row hands the
+        whole deficit to s_bs -- i.e. close_ip('bootstrap'), at zero cost."""
         from bouquet.utils import close_ip, close_ip_q0
         g, c, j_ind, j_bs, j_fix, lin = self._parts(core_bootstrap=False)
         assert j_bs[0] < 1e-30 * j_bs.max()            # pedestal only
@@ -242,7 +243,50 @@ class TestSawtoothBootstrapPredictor:
         b_o, b_b = close_ip("bootstrap", Ip_t, c,
                             lin(j_ind), lin(j_bs), lin(j_fix))
         assert s_o == pytest.approx(b_o, rel=1e-12)
+        assert s_o == pytest.approx(1.0, rel=1e-12)
         assert s_b == pytest.approx(b_b, rel=1e-12)
+
+
+class TestQ0TargetUnrenormalisation:
+    """utils.unrenormalise_q0 -- the REQUESTED reference (user decision).
+
+    The anchor is a solve of the source total renormalised to Ip_target, so
+    its q0 belongs to a current the source never claimed.  The target is that
+    q0 mapped back onto the source's OWN current, to first order in
+    q0 ~ 1/j_phi(0).
+    """
+
+    def test_ratio_formula(self):
+        from bouquet.utils import unrenormalise_q0
+        # 148798 @ 4.470 s, measured: the anchor ran 3.86% hot because FUSE's
+        # core_profiles total carries -3.89% of Ip.
+        q0t = unrenormalise_q0(0.942997745122599, 1606692.5450515286,
+                               1547032.96694553)
+        assert q0t == pytest.approx(
+            0.942997745122599 * (1606692.5450515286 / 1547032.96694553),
+            rel=1e-15)
+        assert q0t > 0.942997745122599          # un-renormalising raises q0
+        assert q0t == pytest.approx(0.9794, abs=5e-4)
+
+    def test_identity_when_the_source_already_carries_ip(self):
+        """No Ip deficit -> achieved == requested -> the target IS the
+        anchor's q0 and the un-renormalisation is a no-op."""
+        from bouquet.utils import unrenormalise_q0
+        assert unrenormalise_q0(1.03, 1.5e6, 1.5e6) == pytest.approx(1.03,
+                                                                     rel=1e-15)
+
+    def test_sign_is_carried_not_stripped(self):
+        """q carries a COCOS sign; the mapping must not silently abs() it --
+        only the GATE compares magnitudes."""
+        from bouquet.utils import unrenormalise_q0
+        assert unrenormalise_q0(-0.99, 1.04e6, 1.0e6) < 0
+
+    def test_zero_and_nan_requested_axis_current_refused(self):
+        from bouquet.utils import unrenormalise_q0
+        with pytest.raises(RuntimeError, match="zero axis"):
+            unrenormalise_q0(1.0, 1.5e6, 0.0)
+        with pytest.raises(RuntimeError, match="non-finite"):
+            unrenormalise_q0(1.0, float("nan"), 1.5e6)
 
     def test_singular_system_refused_on_a_relative_floor(self):
         """Proportional rows (the components indistinguishable in both
@@ -274,11 +318,13 @@ class TestSawtoothGateInputs:
         assert Baseline.__dataclass_fields__["sawtooth"].default is None
 
     def test_gate_logic_admits_sawteeth_or_low_q0(self):
-        """The gate is OR: an active sawtooth source admits a slice whose
-        q0_ref sits above q0_gate, and a low q0_ref admits a slice whose
-        source carries no sawtooth model at all.  The q comparison is on the
-        MAGNITUDE -- q carries a COCOS sign, and a negative q0_ref would
-        otherwise make the threshold trivially true and bypass the gate."""
+        """The gate is OR, and it tests q0_TARGET (the q0 being claimed for
+        the source's own current), not the renormalised anchor value: an
+        active sawtooth source admits a slice whose q0_target sits above
+        q0_gate, and a low q0_target admits a slice whose source carries no
+        sawtooth model at all.  The comparison is on the MAGNITUDE -- q
+        carries a COCOS sign, and a negative target would otherwise make the
+        threshold trivially true and bypass the gate."""
         gate = lambda active, q0, q0_gate=1.1: bool(active) or abs(q0) <= q0_gate
         assert gate(True, 1.35)
         assert gate(False, 0.98)

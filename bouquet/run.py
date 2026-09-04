@@ -597,32 +597,57 @@ class Bouquet:
         needs (``None`` when the gate rejected the slice and the plain bootstrap
         channel took over, since there is then nothing to correct).
 
-        **q0_ref costs nothing.**  The anchor snapshot handed in here is, by
-        construction, the converged forward solve of the SOURCE's own total
-        current (``_forward_solve_imas_baseline`` does ``solve_jphi(bl.j_phi)``
-        and only then takes ``copy_eq()``, before ``solve_with_bootstrap``
-        moves the equilibrium).  So the estimator-consistent reference the plan
-        asks for -- "the TokaMaker q0 of FUSE's own total re-solved on the
-        anchor geometry", not the dd's own q estimator (issue #20) -- is just
-        the anchor's own q at the clipped axis.  No dedicated solve is spent.
+        **The reference is FUSE's own total at its OWN current -- the
+        REQUESTED profile, not the renormalised anchor.**  The anchor snapshot
+        handed in here is, by construction, the converged forward solve of the
+        source's own total (``_forward_solve_imas_baseline`` does
+        ``solve_jphi(bl.j_phi)`` and only then takes ``copy_eq()``, before
+        ``solve_with_bootstrap`` moves the equilibrium), so ``q0_anchor`` --
+        TokaMaker's own q for that solve, never the dd's q estimator (issue
+        #20) -- costs no dedicated solve.  But ``solve_jphi`` hands TokaMaker a
+        jphi-linterp SHAPE and TokaMaker renormalises it to Ip_target, and
+        FUSE's ``core_profiles`` total does not carry Ip (-3.89 % on the
+        148798 reference slice), so the anchor actually ran on ~1.039x the
+        requested profile.  ``q0_anchor`` therefore belongs to a rescaled
+        current that FUSE never claimed.
 
-        **j_ref(0) is the anchor's ACHIEVED axis current, not the requested
-        FUSE total's.**  ``solve_jphi`` hands TokaMaker a jphi-linterp SHAPE
-        and TokaMaker renormalises it to Ip_target; FUSE's total carries a few
-        % less than Ip (-3.7 % on the 148798 reference slice), so the anchor
-        actually ran on ~1.04x the requested profile and its q0_ref belongs to
-        THAT state.  Targeting the requested ``FUSE_tot[0]`` would therefore
-        bake the whole Ip deficit into the axis match as a systematic q0 error
-        several times ``q0_tol``, and the corrector would fire on every slice.
-        The anchor's GS-reconstructed own profile (``probe``, which round-trips
-        to its achieved Ip) carries the achieved value; both are recorded.
-        The closed hybrid needs no such correction: it already integrates to
-        Ip_target in the same affine measure, so its own renormalisation factor
-        is 1 and requested == achieved to the geometry drift.
+        Pinning to it would propagate that known DATA artefact into the current
+        split -- every other channel absorbs the Ip deficit into ONE scale and
+        leaves the shape alone.  So the target is un-renormalised back to
+        FUSE's own current, to the same first order the whole predictor uses
+        (``q0 ~ 1/j_phi(0)`` at frozen geometry):
+
+        .. code-block:: text
+
+            q0_target = q0_anchor * (j_achieved(0) / j_requested(0))
+
+        and the axis row is matched against ``j_requested(0)`` = the source
+        total at the clipped axis.  Both axis currents and their ratio are
+        recorded so the un-renormalisation is auditable, and the gate tests
+        ``|q0_target|`` -- the physical q0 being claimed -- not the anchor's.
+
+        Consequence, and the point of the channel: where the recomputed
+        bootstrap has negligible core content this drives ``s_ohm -> ~1`` and
+        the mode reduces to ``"bootstrap"``, as the plan predicts (measured
+        0.9977 on the 148798 reference slice).  It diverges only where the
+        bootstrap carries real core current, which is exactly the regime the
+        q0 pin exists for.
+
+        **Measured accuracy of the first-order model.**  Matching the axis
+        current exactly (it IS exact by construction, to 1e-15) still left
+        q0 = 0.9871 against a target of 0.9794 on the reference slice -- an
+        0.8 % model error, comparable to the ~0.9 % scale adjustment being
+        made.  The Ip-closed hybrid reproduces its requested current as an
+        INTEGRAL but not pointwise on axis: the single-pass jphi-linterp solve
+        lands the achieved j_phi a fraction of a percent off the request, and
+        the re-converged geometry is not quite the frozen anchor either.  So
+        ``q0_tol`` is not a numerical nicety -- it is the band inside which
+        this linearisation is trustworthy, and a slice whose residual exceeds
+        it needs the corrector's MEASURED ``dq0/ds_ohm``, not a wider band.
         """
         import numpy as np
 
-        from .utils import close_ip_q0
+        from .utils import close_ip_q0, unrenormalise_q0
 
         psi_q = np.ascontiguousarray(np.asarray(geom["psi_q"], dtype=float))
         psi_geom = np.asarray(geom["psi_N"], dtype=float)
@@ -631,25 +656,38 @@ class Bouquet:
         # tracer onto the magnetic axis there (fsa_current_geometry docstring).
         _ax = lambda j: float(np.interp(psi_q[0], psi_geom,
                                         np.asarray(j, dtype=float)))
-        q0_ref = float(np.asarray(eq_snap.get_q(psi=psi_q.copy())[1],
-                                  dtype=float)[0])
-        j_ref0 = float(np.asarray(probe, dtype=float)[0])
-        j_ref0_requested = _ax(FUSE_tot)
+        q0_anchor = float(np.asarray(eq_snap.get_q(psi=psi_q.copy())[1],
+                                     dtype=float)[0])
+        # ACHIEVED: the anchor's GS-reconstructed own profile (round-trips to
+        # its achieved Ip).  REQUESTED: the source total that was handed in.
+        # Their ratio IS TokaMaker's Ip renormalisation of the anchor.
+        j_achieved0 = float(np.asarray(probe, dtype=float)[0])
+        j_requested0 = _ax(FUSE_tot)
+        # The algebra lives in utils.unrenormalise_q0 so the tests exercise
+        # the SHIPPED formula, not a re-derivation (same rule as close_ip).
+        q0_target = unrenormalise_q0(q0_anchor, j_achieved0, j_requested0)
+        j_renorm_ratio = j_achieved0 / j_requested0
+        j_ref0 = j_requested0
         j_ind0, j_bs0, j_fix0 = _ax(j_ind), _ax(j_BS_swb), _ax(j_fixed)
 
         saw = dict(getattr(bl, "sawtooth", None) or {})
         q0_dd = saw.get("q0_dd")
         saw_active = bool(saw.get("active"))
         q0_gate = float(getattr(gc, "q0_gate", 1.1))
+        # The gate tests q0_TARGET -- the q0 actually being claimed for FUSE's
+        # own current -- not the renormalised anchor value, which on a slice
+        # with a large Ip deficit can sit on the other side of the threshold.
         # abs(): q carries a COCOS sign (this dd's own q[0] reads -0.99), and a
-        # negative q0_ref would make "q0_ref <= q0_gate" trivially true and
-        # bypass the gate silently.  Only the comparison is taken on the
-        # magnitude -- the raw signed value is what gets recorded, and the
-        # residual/Newton algebra below is sign-agnostic because q0_ref and
-        # q0_tok come from the same estimator.
-        gated = saw_active or (abs(q0_ref) <= q0_gate)
-        print(f"[imas SWB-split:ohmic q0] q0_ref={q0_ref:.4f} (TokaMaker, "
-              f"source total on the anchor, psi_N={psi_q[0]:.1e}) | "
+        # negative target would make "q0 <= q0_gate" trivially true and bypass
+        # the gate silently.  Only the COMPARISON is on the magnitude -- the
+        # raw signed values are what get recorded, and the residual/Newton
+        # algebra is sign-agnostic because target and solved q share the
+        # estimator.
+        gated = saw_active or (abs(q0_target) <= q0_gate)
+        print(f"[imas SWB-split:ohmic q0] q0_target={q0_target:.4f} "
+              f"(= q0_anchor {q0_anchor:.4f} x j_achieved/j_requested "
+              f"{j_renorm_ratio:.4f}, un-renormalised onto FUSE's own current; "
+              f"psi_N={psi_q[0]:.1e}) | "
               f"q0_dd={'n/a' if q0_dd is None else format(q0_dd, '.4f')} | "
               f"sawtooth source {'ACTIVE' if saw_active else ('idle' if saw.get('present') else 'absent')}"
               f" (index {saw.get('source_index')}, max|j_par|="
@@ -657,24 +695,32 @@ class Bouquet:
               flush=True)
 
         extra = dict(
-            q0_ref=q0_ref,
-            q0_ref_source=("anchor copy_eq snapshot == converged forward solve "
-                           "of the source total (jphi-linterp, renormalised to "
-                           "Ip_target); get_q at the psi_pad-clipped axis"),
-            q0_ref_psi_N=float(psi_q[0]),
+            q0_target=q0_target,
+            q0_anchor=q0_anchor,
+            q0_target_source=(
+                "q0_anchor * (j_achieved0/j_requested0): the anchor copy_eq "
+                "snapshot is the converged forward solve of the source total, "
+                "but solve_jphi renormalises that SHAPE to Ip_target, so its "
+                "q0 belongs to a current FUSE never claimed; the ratio undoes "
+                "that to first order (q0 ~ 1/j_phi(0) at frozen geometry). "
+                "get_q at the psi_pad-clipped axis; never the dd's own q "
+                "estimator (issue #20)"),
+            q0_target_psi_N=float(psi_q[0]),
             q0_dd=q0_dd,
             q0_gate=q0_gate,
             sawtooth_active=saw_active,
             sawtooth_present=bool(saw.get("present", False)),
             sawtooth_j_par_max_abs=float(saw.get("j_par_max_abs", 0.0)),
-            j_ref0_achieved=j_ref0,
-            j_ref0_requested=j_ref0_requested,
+            j_ref0_achieved=j_achieved0,
+            j_ref0_requested=j_requested0,
+            j_renorm_ratio=j_renorm_ratio,
+            j_ref0_used=j_ref0,
             j_ind0=j_ind0, j_bs0=j_bs0, j_fix0=j_fix0,
             n_extra_solves=0,
         )
         if not gated:
             print("[imas SWB-split:ohmic q0] GATE REJECTED: no active sawtooth "
-                  f"source and |q0_ref| {abs(q0_ref):.4f} > q0_gate {q0_gate:g} -- the "
+                  f"source and |q0_target| {abs(q0_target):.4f} > q0_gate {q0_gate:g} -- the "
                   "q0 pin is not physically justified here (reversed shear / "
                   "early ramp: the source's own q0 is model-dependent). "
                   "Falling back to closure_channel='bootstrap'.", flush=True)
@@ -688,24 +734,24 @@ class Bouquet:
             j_ind0, j_bs0, j_fix0, j_ref0)
         j0_pred = ohm_scale * j_ind0 + bs_scale * j_bs0 + j_fix0
         # First-order predicted q0 of the closed hybrid: q0 ~ 1/j0 at frozen
-        # geometry, so q0_pred = q0_ref * j_ref0/j0_pred -- identically q0_ref
-        # when the 2x2 solved exactly.  Kept as an explicit record because a
-        # bounds-clipped or degenerate solve would show up here first.
+        # geometry, so q0_pred = q0_target * j_ref0/j0_pred -- identically
+        # q0_target when the 2x2 solved exactly.  Kept as an explicit record
+        # because a bounds-clipped or degenerate solve shows up here first.
         extra.update(
             sawtooth_verdict="gate admitted -> predictor",
             q0_predictor_ohm_scale=float(ohm_scale),
             q0_predictor_bs_scale=float(bs_scale),
             q0_axis_current_target=j_ref0,
             q0_axis_current_predicted=float(j0_pred),
-            q0_predicted=float(q0_ref * j_ref0 / j0_pred) if j0_pred else None,
+            q0_predicted=float(q0_target * j_ref0 / j0_pred) if j0_pred else None,
         )
         print(f"[imas SWB-split:ohmic q0] predictor 2x2 (0 extra solves): "
               f"s_ohm={ohm_scale:.4f} s_bs={bs_scale:.4f}; axis j "
               f"{j0_pred/1e6:.4f} -> target {j_ref0/1e6:.4f} MA/m^2 "
-              f"(requested-FUSE axis j would have been "
-              f"{j_ref0_requested/1e6:.4f})", flush=True)
+              f"(= FUSE's own requested axis j; the anchor's ACHIEVED was "
+              f"{j_achieved0/1e6:.4f}, ratio {j_renorm_ratio:.4f})", flush=True)
         state = dict(
-            q0_ref=q0_ref, psi_q=psi_q,
+            q0_target=q0_target, psi_q=psi_q,
             j_ind=np.asarray(j_ind, dtype=float),
             j_BS_swb=np.asarray(j_BS_swb, dtype=float),
             j_fixed=np.asarray(j_fixed, dtype=float),
@@ -730,14 +776,14 @@ class Bouquet:
         """
         import numpy as np
 
-        q0_ref = state["q0_ref"]
+        q0_target = state["q0_target"]
         # Read q off a copy_eq() SNAPSHOT, never the live solver: the geqdsk
         # save path already carries a suspected live-state mutation by the q
         # tracer, and a diagnostic read must not be able to move the
         # equilibrium the baseline is about to be archived from.
         q0_tok = float(np.asarray(mygs.copy_eq().get_q(psi=state["psi_q"].copy())[1],
                                   dtype=float)[0])
-        res = q0_tok - q0_ref
+        res = q0_tok - q0_target
         rec = dict(q0_solved_predictor=q0_tok,
                    q0_predictor_residual=res,
                    q0_tol=state["q0_tol"])
@@ -747,7 +793,7 @@ class Bouquet:
                        sawtooth_verdict="predictor (0 extra solves)",
                        q0_solved=q0_tok, q0_residual=res)
             print(f"[imas SWB-split:ohmic q0] solved q0={q0_tok:.4f} vs "
-                  f"q0_ref={q0_ref:.4f} (residual {res:+.4f}, tol "
+                  f"q0_target={q0_target:.4f} (residual {res:+.4f}, tol "
                   f"{state['q0_tol']:g}) -- predictor accepted, no extra solve",
                   flush=True)
         else:
@@ -768,7 +814,7 @@ class Bouquet:
                       "Newton direction; keeping the predictor and recording "
                       f"the residual {res:+.4f}", flush=True)
             else:
-                s_new = state["ohm_scale"] + (q0_ref - q0_tok) / dq0ds
+                s_new = state["ohm_scale"] + (q0_target - q0_tok) / dq0ds
                 sbs_new = (state["sgn"] * state["Ip_t"] - state["c_affine"]
                            - s_new * state["ip_ind"]
                            - state["ip_fix"]) / state["ip_bs"]
@@ -797,13 +843,13 @@ class Bouquet:
                                q0_corrector_ohm_scale=float(s_new),
                                q0_corrector_bs_scale=float(sbs_new),
                                q0_dq0_ds_ohm=float(dq0ds),
-                               q0_solved=q0_new, q0_residual=q0_new - q0_ref,
+                               q0_solved=q0_new, q0_residual=q0_new - q0_target,
                                sawtooth_verdict="predictor + 1 corrector solve")
                     print(f"[imas SWB-split:ohmic q0] 1 corrector solve: "
                           f"s_ohm {state['ohm_scale']:.4f}->{s_new:.4f}, "
                           f"s_bs {state['bs_scale']:.4f}->{sbs_new:.4f}; "
-                          f"q0 {q0_tok:.4f}->{q0_new:.4f} vs ref {q0_ref:.4f} "
-                          f"(residual {q0_new - q0_ref:+.4f})", flush=True)
+                          f"q0 {q0_tok:.4f}->{q0_new:.4f} vs target {q0_target:.4f} "
+                          f"(residual {q0_new - q0_target:+.4f})", flush=True)
         rec["ohm_scale"] = float(getattr(bl, "ohm_scale", 1.0))
         rec["bs_scale"] = float(getattr(bl, "bs_scale", 1.0))
         if getattr(bl, "ip_closure", None) is not None:
@@ -1339,6 +1385,19 @@ class Bouquet:
                        ohm_scale=float(getattr(bl, "ohm_scale", 1.0)))
         if getattr(bl, "ip_closure", None):
             metrics["ip_closure"] = dict(bl.ip_closure)
+        # Sawtooth gate inputs travel with EVERY IMAS baseline, not just the
+        # runs that used closure_channel="sawtooth_bootstrap": a fan-out
+        # needs to see which slices the gate would admit or reject without
+        # re-reading a 100s-of-MB dd per slice, and the q0-channel run is
+        # exactly the run you do not have yet when you are choosing slices.
+        # q0_target lands here too when the channel computed one.
+        if getattr(bl, "sawtooth", None):
+            _sw = dict(bl.sawtooth)
+            _icl = getattr(bl, "ip_closure", None) or {}
+            if "q0_target" in _icl:
+                _sw["q0_target"] = _icl["q0_target"]
+                _sw["q0_anchor"] = _icl.get("q0_anchor")
+            metrics["sawtooth"] = _sw
         bl.li_metrics = metrics
         # Target TokaMaker li_3 ('iter').  The IMAS path is not itself affected
         # by the geqdsk estimator mismatch (both sides come from TokaMaker),
