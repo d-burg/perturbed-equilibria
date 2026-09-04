@@ -699,6 +699,73 @@ def close_ip(channel, Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
     return scales
 
 
+def close_ip_q0(Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
+                j_ind0, j_bs0, j_fix0, j_ref0,
+                scale_bounds=(0.2, 5.0), det_rtol=1e-6):
+    r"""Both hybrid scales from Ip **and** an on-axis-current (q0) constraint.
+
+    The ``"sawtooth_bootstrap"`` channel's predictor.  Two unknowns
+    (``s_ohm``, ``s_bs``), two targets, one 2x2 linear system and **no GS
+    solve**:
+
+    .. code-block:: text
+
+        s_ohm*j_ind0 + s_bs*j_bs0 = j_ref0 - j_fix0      (axis current -> q0)
+        s_ohm*ip_ind + s_bs*ip_bs = Ip_signed - c - ip_fix   (exact Ip, affine)
+
+    The first row is the q0 constraint *linearised*: at frozen anchor geometry
+    (kappa0, B0, R0 fixed with the snapshot) the on-axis safety factor is
+    ``q0 = 2 B0 (1 + kappa0^2) / (2 kappa0 mu0 R0 j0)``, i.e. ``q0 ~ 1/j0``, so
+    matching q0 to the reference equilibrium is -- to first order -- matching
+    its on-axis toroidal current density ``j_ref0``.  All the ``j*0`` are the
+    profile values at the SAME psi_N sample, the psi_pad-clipped axis of
+    :func:`fsa_current_geometry` (never psi_N = 0 exactly; see that docstring's
+    collapse trap).  The second row is untouched from :func:`close_ip`: the
+    LINEAR parts of the affine FSA measure with the P' term ``c`` carried once,
+    so Ip stays exact by construction wherever this succeeds.
+
+    Degenerate by design where the recomputed bootstrap has no core content:
+    ``j_bs0 ~ 0`` makes row 1 pin ``s_ohm = (j_ref0 - j_fix0)/j_ind0`` (~1 when
+    the source's own axis current is reproduced) and row 2 hand the whole Ip
+    deficit to ``s_bs`` -- the channel reduces to ``"bootstrap"`` at zero cost.
+    That is not the singular case; the singular case is the two rows becoming
+    proportional, which is refused against a RELATIVE determinant floor
+    (``det_rtol``) rather than an absolute one, because ``ip_*`` are amps and
+    ``j*0`` are A/m^2 and no absolute epsilon is meaningful across both.
+
+    Raises ``RuntimeError`` on a singular system, on non-finite inputs, or when
+    either scale leaves ``scale_bounds`` -- the three sources then simply do not
+    admit a common (Ip, q0) solution, which is a finding to report, not
+    something to hide behind a rescale.  Returns ``(ohm_scale, bs_scale)``.
+    """
+    vals = (Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
+            j_ind0, j_bs0, j_fix0, j_ref0)
+    if not all(np.isfinite(float(v)) for v in vals):
+        raise RuntimeError("close_ip_q0: non-finite input "
+                           f"{tuple(float(v) for v in vals)}")
+    b_axis = float(j_ref0) - float(j_fix0)
+    b_ip = float(Ip_target_signed) - float(c_affine) - float(ip_fix)
+    det = float(j_ind0) * float(ip_bs) - float(j_bs0) * float(ip_ind)
+    floor = det_rtol * max(abs(float(j_ind0)), abs(float(j_bs0))) \
+        * max(abs(float(ip_ind)), abs(float(ip_bs)))
+    if abs(det) <= floor:
+        raise RuntimeError(
+            f"close_ip_q0: singular 2x2 (det {det:.4e} <= relative floor "
+            f"{floor:.4e}) -- the inductive and bootstrap components are "
+            "proportional in (axis current, Ip); Ip and q0 cannot both be "
+            "imposed on this split")
+    ohm_scale = (b_axis * float(ip_bs) - b_ip * float(j_bs0)) / det
+    bs_scale = (float(j_ind0) * b_ip - float(ip_ind) * b_axis) / det
+    lo, hi = scale_bounds
+    for name, s in (("ohm_scale", ohm_scale), ("bs_scale", bs_scale)):
+        if not (lo < s < hi):
+            raise RuntimeError(
+                f"close_ip_q0: {name} {s:.3f} is outside [{lo:g}, {hi:g}] -- "
+                "no (Ip, q0)-consistent split exists within the scale bounds; "
+                "refusing to hide that behind a rescale")
+    return ohm_scale, bs_scale
+
+
 def Ip_fsa_integral(eq, psi_N, j_profile, convention="jphi-linterp",
                     psi_pad=_FSA_PSI_PAD, pprime_sign=1.0, geom=None):
     r"""Plasma current [A] carried by a bouquet current profile.

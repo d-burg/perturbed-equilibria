@@ -398,7 +398,30 @@ class GenerationConfig:
     #: closure on j_ohmic hollows the core and lifts q_min against the measured
     #: value whenever the recomputed bootstrap fraction is far above the source's.
     #: Run both channels to bracket the closure uncertainty.
+    #: "sawtooth_bootstrap" is "bootstrap" plus a q0 constraint: on a sawtoothing
+    #: flattop q0 ~ 1 is a robust physical fact, and the plain bootstrap channel
+    #: has nothing holding q0 in place (a large s_bs down-scale removes the CORE
+    #: share of the bootstrap too).  Both scales are then determined -- Ip exactly
+    #: (the affine FSA measure) and q0 to first order (the on-axis current
+    #: density, at frozen anchor geometry) -- by a 2x2 linear solve that costs no
+    #: extra GS solve, with at most ONE Newton correction after the closed-hybrid
+    #: solve.  Where the recomputed bootstrap has negligible core content it
+    #: reduces to "bootstrap" exactly.
     closure_channel: str = "bootstrap"
+    #: closure_channel="sawtooth_bootstrap" gate: the q0 pin is only well-founded
+    #: where sawteeth justify it.  Admitted when the source's sawtooth model is
+    #: active at the slice (core_sources identifier index 701 carrying non-zero
+    #: j_parallel) OR the reference q0 is at/below this value; otherwise the slice
+    #: falls back to the plain "bootstrap" channel with a printed note (never
+    #: silently -- on reversed shear / early ramp the source's own q0 is
+    #: model-dependent and pinning to it is not obviously better than bootstrap).
+    q0_gate: float = 1.1
+    #: Absolute q0 acceptance for closure_channel="sawtooth_bootstrap".  The
+    #: predictor is first-order (q0 ~ 1/j_phi(0) at frozen geometry); if the
+    #: solved q0 lands further than this from q0_ref, ONE analytic Newton step
+    #: along the Ip-closed manifold is taken and its result accepted whatever it
+    #: gives.  There is no iteration loop -- the cost ceiling is the point.
+    q0_tol: float = 0.01
     # Fix B: when the recon-anchor's equilibrium l_i is already within the band,
     # accept the anchor and skip find_optimal_scale + the corrective iteration
     # (which otherwise overshoot l_i and drift degenerate coils off baseline).

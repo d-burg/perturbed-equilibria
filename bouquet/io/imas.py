@@ -51,6 +51,12 @@ if TYPE_CHECKING:
 
 # Core-source identifier index for neutral-beam current drive.
 NBI_SOURCE_INDEX = 2          # neutral beam injection -> summed into j_NBI
+# Core-source identifier index for the sawtooth model (IMAS core_sources
+# identifier enumeration).  NOT summed into any current here: it is read only as
+# a slice-level FLAG -- "is the source's sawtooth model doing anything at this
+# time?" -- for the closure_channel="sawtooth_bootstrap" gate, which pins q0
+# only where sawteeth make q0 ~ 1 a physical fact rather than a model artefact.
+SAWTOOTH_SOURCE_INDEX = 701
 # NOTE: j_RF is NOT computed internally (RF is the least-common input). It is
 # left as zeros and accepted as a user-supplied array via
 # FixedComponentsConfig.j_RF. See the "revisit RF" flag in the project notes
@@ -304,6 +310,27 @@ def read_imas_baseline(
     j_NBI = to_toroidal(jnbi_par)
     j_RF = np.zeros(n)   # never computed internally; user-supplied only
 
+    # --- sawtooth model presence/amplitude at this slice (gate input only) ----
+    # Read here because the dd (100s of MB) is not retained past this function.
+    # "active" means the source EXISTS and carries a non-zero j_parallel at this
+    # time index: a declared-but-idle sawtooth source (all zeros before onset)
+    # must NOT admit a ramp slice to the q0 pin.
+    sawtooth = {"source_index": SAWTOOTH_SOURCE_INDEX, "present": False,
+                "j_par_max_abs": 0.0, "active": False, "q0_dd": None}
+    for s in src_ids.get("source", []):
+        if s.get("identifier", {}).get("index") == SAWTOOTH_SOURCE_INDEX:
+            sawtooth["present"] = True
+            pr = s.get("profiles_1d", [])
+            if pr:
+                jsaw = np.asarray(pr[isrc if len(pr) > isrc else 0]
+                                  .get("j_parallel", []), dtype=float)
+                if jsaw.size and np.any(np.isfinite(jsaw)):
+                    sawtooth["j_par_max_abs"] = max(
+                        sawtooth["j_par_max_abs"],
+                        float(np.nanmax(np.abs(jsaw))))
+    sawtooth["active"] = bool(sawtooth["present"]
+                              and sawtooth["j_par_max_abs"] > 0.0)
+
     # --- kinetic profiles + Zeff + fast pressure ---
     el = cp["electrons"]
     ne = np.asarray(el["density_thermal"], dtype=float)
@@ -386,6 +413,13 @@ def read_imas_baseline(
     _o = np.argsort(psiN_eq)
     p_equilibrium = np.interp(psi_N, psiN_eq[_o],
                               np.asarray(eqp1["pressure"], dtype=float)[_o])
+    # The dd's OWN axis q -- taken at the SMALLEST psi_N (via the same ordering
+    # the pressure uses), not blindly at index 0, since profiles_1d need not be
+    # stored axis-first.  Comparison metric only; see Baseline.sawtooth.
+    if "q" in eqp1:
+        _qdd = np.asarray(eqp1["q"], dtype=float)[_o]
+        if _qdd.size and np.isfinite(_qdd[0]):
+            sawtooth["q0_dd"] = float(_qdd[0])
     Z_imp = effective_impurity_charge(ne, ni, Zeff)
     p_imp = impurity_pressure(ne, ni, ti, Z_imp)
     p_recon = _EC * (ne * te + ni * ti) + p_imp + p_fast
@@ -438,6 +472,7 @@ def read_imas_baseline(
         pfile_bytes=None,
         li_metrics={"ids_li_1": ids_li_1, "ids_li_3": ids_li_3},
         aux=aux,
+        sawtooth=sawtooth,
     )
 
 
