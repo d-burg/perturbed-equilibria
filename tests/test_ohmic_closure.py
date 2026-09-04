@@ -276,11 +276,15 @@ class TestSawtoothGateInputs:
     def test_gate_logic_admits_sawteeth_or_low_q0(self):
         """The gate is OR: an active sawtooth source admits a slice whose
         q0_ref sits above q0_gate, and a low q0_ref admits a slice whose
-        source carries no sawtooth model at all."""
-        gate = lambda active, q0, q0_gate=1.1: bool(active) or q0 <= q0_gate
+        source carries no sawtooth model at all.  The q comparison is on the
+        MAGNITUDE -- q carries a COCOS sign, and a negative q0_ref would
+        otherwise make the threshold trivially true and bypass the gate."""
+        gate = lambda active, q0, q0_gate=1.1: bool(active) or abs(q0) <= q0_gate
         assert gate(True, 1.35)
         assert gate(False, 0.98)
         assert not gate(False, 1.35)
+        assert not gate(False, -1.35)
+        assert gate(False, -0.98)
 
     def test_idle_sawtooth_source_is_not_active(self):
         """A declared-but-IDLE sawtooth source (all-zero j_parallel before

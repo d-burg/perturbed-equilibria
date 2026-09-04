@@ -641,7 +641,13 @@ class Bouquet:
         q0_dd = saw.get("q0_dd")
         saw_active = bool(saw.get("active"))
         q0_gate = float(getattr(gc, "q0_gate", 1.1))
-        gated = saw_active or (q0_ref <= q0_gate)
+        # abs(): q carries a COCOS sign (this dd's own q[0] reads -0.99), and a
+        # negative q0_ref would make "q0_ref <= q0_gate" trivially true and
+        # bypass the gate silently.  Only the comparison is taken on the
+        # magnitude -- the raw signed value is what gets recorded, and the
+        # residual/Newton algebra below is sign-agnostic because q0_ref and
+        # q0_tok come from the same estimator.
+        gated = saw_active or (abs(q0_ref) <= q0_gate)
         print(f"[imas SWB-split:ohmic q0] q0_ref={q0_ref:.4f} (TokaMaker, "
               f"source total on the anchor, psi_N={psi_q[0]:.1e}) | "
               f"q0_dd={'n/a' if q0_dd is None else format(q0_dd, '.4f')} | "
@@ -668,7 +674,7 @@ class Bouquet:
         )
         if not gated:
             print("[imas SWB-split:ohmic q0] GATE REJECTED: no active sawtooth "
-                  f"source and q0_ref {q0_ref:.4f} > q0_gate {q0_gate:g} -- the "
+                  f"source and |q0_ref| {abs(q0_ref):.4f} > q0_gate {q0_gate:g} -- the "
                   "q0 pin is not physically justified here (reversed shear / "
                   "early ramp: the source's own q0 is model-dependent). "
                   "Falling back to closure_channel='bootstrap'.", flush=True)
@@ -725,7 +731,11 @@ class Bouquet:
         import numpy as np
 
         q0_ref = state["q0_ref"]
-        q0_tok = float(np.asarray(mygs.get_q(psi=state["psi_q"].copy())[1],
+        # Read q off a copy_eq() SNAPSHOT, never the live solver: the geqdsk
+        # save path already carries a suspected live-state mutation by the q
+        # tracer, and a diagnostic read must not be able to move the
+        # equilibrium the baseline is about to be archived from.
+        q0_tok = float(np.asarray(mygs.copy_eq().get_q(psi=state["psi_q"].copy())[1],
                                   dtype=float)[0])
         res = q0_tok - q0_ref
         rec = dict(q0_solved_predictor=q0_tok,
@@ -781,7 +791,8 @@ class Bouquet:
                     bl.j_phi = bl.j_inductive + bl.j_BS + state["j_fixed"]
                     nl_out = solve_jphi(np.asarray(bl.j_phi, dtype=float))
                     q0_new = float(np.asarray(
-                        mygs.get_q(psi=state["psi_q"].copy())[1], dtype=float)[0])
+                        mygs.copy_eq().get_q(psi=state["psi_q"].copy())[1],
+                        dtype=float)[0])
                     rec.update(n_extra_solves=1,
                                q0_corrector_ohm_scale=float(s_new),
                                q0_corrector_bs_scale=float(sbs_new),
