@@ -258,7 +258,7 @@ class TestQ0TargetUnrenormalisation:
 
     def test_ratio_formula(self):
         from bouquet.utils import unrenormalise_q0
-        # 148798 @ 4.470 s, measured: the anchor ran 3.86% hot because FUSE's
+        # reference validation slice, measured: the anchor ran 3.86% hot because FUSE's
         # core_profiles total carries -3.89% of Ip.
         q0t = unrenormalise_q0(0.942997745122599, 1606692.5450515286,
                                1547032.96694553)
@@ -392,3 +392,77 @@ class TestDefaults:
         assert GenerationConfig().closure_channel == "bootstrap"
         assert Baseline.__dataclass_fields__["ohm_scale"].default == 1.0
         assert Baseline.__dataclass_fields__["ip_closure"].default is None
+
+
+class TestQ0Gate:
+    """utils.q0_gate_admits -- gate on the source's own |q0_dd|, not the
+    estimator-mapped target (which reads lower and admitted idle-sawtooth
+    ramp slices in the first campaign)."""
+
+    def test_sawtooth_activity_admits_regardless_of_q0(self):
+        from bouquet.utils import q0_gate_admits
+        assert q0_gate_admits(True, 1.8, 1.7, 1.1) == (True, "sawtooth active")
+
+    def test_idle_sawteeth_gate_on_source_q0_not_target(self):
+        """The Tier-A calibration failure: q0_dd 1.15 (above gate) with a
+        target that reads 1.05 (below) must be REJECTED."""
+        from bouquet.utils import q0_gate_admits
+        ok, basis = q0_gate_admits(False, 1.15, 1.05, 1.1)
+        assert ok is False and basis == "|q0_dd|"
+        ok, basis = q0_gate_admits(False, 0.99, 1.05, 1.1)
+        assert ok is True and basis == "|q0_dd|"
+
+    def test_cocos_sign_is_compared_by_magnitude(self):
+        from bouquet.utils import q0_gate_admits
+        assert q0_gate_admits(False, -0.99, -0.95, 1.1)[0] is True
+        assert q0_gate_admits(False, -1.30, -1.25, 1.1)[0] is False
+
+    def test_falls_back_to_target_only_without_source_q0(self):
+        from bouquet.utils import q0_gate_admits
+        ok, basis = q0_gate_admits(False, None, 1.05, 1.1)
+        assert ok is True and basis.startswith("|q0_target|")
+        assert q0_gate_admits(False, None, None, 1.1) == (False, "no q0 available")
+
+
+class TestClosureHealth:
+    """utils.closure_health -- the closure-limited flag every channel records."""
+
+    def _h(self, **kw):
+        from bouquet.utils import closure_health
+        base = dict(ohm_scale=1.0, bs_scale=0.9, Ip_target_signed=1.2e6,
+                    c_affine=-3.0e4, ip_ind=9.0e5, ip_bs=2.5e5, ip_fix=8.0e4)
+        base.update(kw)
+        return closure_health(**base)
+
+    def test_clean_slice_is_not_limited(self):
+        h = self._h()          # raw sum 1.2e6 -> 0.0 % mismatch
+        assert h["closure_limited"] is False and h["closure_limited_reasons"] == ()
+        assert h["raw_components_ip_mismatch_pct"] == pytest.approx(0.0, abs=1e-9)
+        assert h["f_BS_unscaled"] == pytest.approx(2.5e5 / 1.2e6)
+        assert h["f_BS_closed"] == pytest.approx(0.9 * 2.5e5 / 1.2e6)
+
+    def test_large_raw_mismatch_flags(self):
+        h = self._h(ip_bs=4.5e5)                 # raw sum +16.7 % over Ip
+        assert h["closure_limited"] is True
+        assert any("miss Ip" in r for r in h["closure_limited_reasons"])
+
+    def test_deep_bootstrap_downscale_flags(self):
+        h = self._h(bs_scale=0.41)
+        assert h["closure_limited"] is True
+        assert any("bs_scale" in r for r in h["closure_limited_reasons"])
+
+    def test_negative_current_convention(self):
+        h = self._h(Ip_target_signed=-1.2e6, c_affine=3.0e4, ip_ind=-9.0e5,
+                    ip_bs=-2.5e5, ip_fix=-8.0e4)
+        assert h["closure_limited"] is False
+        assert h["raw_components_ip_mismatch_pct"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_ohmic_channel_is_deprecated_loudly():
+    from bouquet.utils import warn_deprecated_channel
+    with pytest.warns(DeprecationWarning, match="DEPRECATED"):
+        warn_deprecated_channel("ohmic")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warn_deprecated_channel("bootstrap")          # silent
+        warn_deprecated_channel("sawtooth_bootstrap")

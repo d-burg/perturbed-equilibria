@@ -607,7 +607,7 @@ class Bouquet:
         #20) -- costs no dedicated solve.  But ``solve_jphi`` hands TokaMaker a
         jphi-linterp SHAPE and TokaMaker renormalises it to Ip_target, and
         FUSE's ``core_profiles`` total does not carry Ip (-3.89 % on the
-        148798 reference slice), so the anchor actually ran on ~1.039x the
+        reference validation slice), so the anchor actually ran on ~1.039x the
         requested profile.  ``q0_anchor`` therefore belongs to a rescaled
         current that FUSE never claimed.
 
@@ -629,7 +629,7 @@ class Bouquet:
         Consequence, and the point of the channel: where the recomputed
         bootstrap has negligible core content this drives ``s_ohm -> ~1`` and
         the mode reduces to ``"bootstrap"``, as the plan predicts (measured
-        0.9977 on the 148798 reference slice).  It diverges only where the
+        0.9977 on the reference validation slice).  It diverges only where the
         bootstrap carries real core current, which is exactly the regime the
         q0 pin exists for.
 
@@ -683,7 +683,12 @@ class Bouquet:
         # raw signed values are what get recorded, and the residual/Newton
         # algebra is sign-agnostic because target and solved q share the
         # estimator.
-        gated = saw_active or (abs(q0_target) <= q0_gate)
+        # Gate on the SOURCE's own |q0_dd| (physically clamped on a sawtoothing
+        # discharge) OR sawtooth activity; q0_target is the estimator mapping
+        # and reads lower -- gating on it admitted idle-sawtooth ramp slices.
+        from .utils import q0_gate_admits
+        gated, gate_basis = q0_gate_admits(saw_active, q0_dd, q0_target,
+                                           q0_gate)
         print(f"[imas SWB-split:ohmic q0] q0_target={q0_target:.4f} "
               f"(= q0_anchor {q0_anchor:.4f} x j_achieved/j_requested "
               f"{j_renorm_ratio:.4f}, un-renormalised onto FUSE's own current; "
@@ -691,8 +696,8 @@ class Bouquet:
               f"q0_dd={'n/a' if q0_dd is None else format(q0_dd, '.4f')} | "
               f"sawtooth source {'ACTIVE' if saw_active else ('idle' if saw.get('present') else 'absent')}"
               f" (index {saw.get('source_index')}, max|j_par|="
-              f"{saw.get('j_par_max_abs', 0.0):.3e} A/m^2) | q0_gate={q0_gate:g}",
-              flush=True)
+              f"{saw.get('j_par_max_abs', 0.0):.3e} A/m^2) | q0_gate={q0_gate:g} "
+              f"on {gate_basis}", flush=True)
 
         extra = dict(
             q0_target=q0_target,
@@ -708,6 +713,7 @@ class Bouquet:
             q0_target_psi_N=float(psi_q[0]),
             q0_dd=q0_dd,
             q0_gate=q0_gate,
+            q0_gate_basis=gate_basis,
             sawtooth_active=saw_active,
             sawtooth_present=bool(saw.get("present", False)),
             sawtooth_j_par_max_abs=float(saw.get("j_par_max_abs", 0.0)),
@@ -719,8 +725,9 @@ class Bouquet:
             n_extra_solves=0,
         )
         if not gated:
+            _gq = q0_dd if gate_basis.startswith("|q0_dd|") else q0_target
             print("[imas SWB-split:ohmic q0] GATE REJECTED: no active sawtooth "
-                  f"source and |q0_target| {abs(q0_target):.4f} > q0_gate {q0_gate:g} -- the "
+                  f"source and {gate_basis} {abs(float(_gq)):.4f} > q0_gate {q0_gate:g} -- the "
                   "q0 pin is not physically justified here (reversed shear / "
                   "early ramp: the source's own q0 is model-dependent). "
                   "Falling back to closure_channel='bootstrap'.", flush=True)
@@ -999,6 +1006,9 @@ class Bouquet:
                 # Validate the channel BEFORE solve_with_bootstrap: the
                 # run-time dispatch would otherwise burn the full SWB
                 # iteration sequence and only then refuse a typo.
+                from .utils import warn_deprecated_channel
+                warn_deprecated_channel(getattr(gc, "closure_channel",
+                                                "bootstrap"))
                 if str(getattr(gc, "closure_channel", "bootstrap")) \
                         not in ("bootstrap", "ohmic", "sawtooth_bootstrap"):
                     raise ValueError(
@@ -1247,6 +1257,18 @@ class Bouquet:
                         "of Ip_target after closure -- algebra error, refusing")
                 _jd = getattr(bl, "jphi_diff", None)
                 ip_jd = _lin(k2e(_jd)) if _jd is not None else 0.0
+                # Closure health, every channel: how much reconciliation one
+                # scale was asked to do.  closure-limited slices are flagged
+                # for downstream (Delta') consumers -- not refused, but not
+                # to be read as validated either.
+                from .utils import closure_health
+                _health = closure_health(ohm_scale, bs_scale, sgn * Ip_t,
+                                         _c_affine, ip_ind, ip_bs, ip_fix)
+                if _health["closure_limited"]:
+                    print("[imas SWB-split:ohmic] WARNING closure-limited: "
+                          + "; ".join(_health["closure_limited_reasons"])
+                          + " -- treat this slice's current split (and any "
+                          "Delta' built on it) as unvalidated", flush=True)
                 _oft_tot, _oft_bs = _ip_oft(FUSE_tot), _ip_oft(j_BS_swb)
                 _oft_fix, _oft_ind = _ip_oft(j_fixed), _ip_oft(j_ind)
                 _cyl_tot, _cyl_bs = _ip_cyl(FUSE_tot), _ip_cyl(j_BS_swb)
@@ -1268,6 +1290,7 @@ class Bouquet:
                     fuse_total_err_pct=fuse_tot_err_pct,
                     Ip_ohmic_unscaled=ip_ind, Ip_jBS_swb=ip_bs, Ip_fixed=ip_fix,
                     closure_channel=_chan,
+                    **_health,
                     ohm_scale=float(ohm_scale), bs_scale=float(getattr(bl, 'bs_scale', 1.0)),
                     Ip_hybrid=_ip(bl.j_phi),
                     jphi_diff_dropped_Ip=ip_jd,
@@ -1385,6 +1408,8 @@ class Bouquet:
                        ohm_scale=float(getattr(bl, "ohm_scale", 1.0)))
         if getattr(bl, "ip_closure", None):
             metrics["ip_closure"] = dict(bl.ip_closure)
+            metrics["closure_limited"] = bool(
+                bl.ip_closure.get("closure_limited", False))
         # Sawtooth gate inputs travel with EVERY IMAS baseline, not just the
         # runs that used closure_channel="sawtooth_bootstrap": a fan-out
         # needs to see which slices the gate would admit or reject without

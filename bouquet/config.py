@@ -393,11 +393,23 @@ class GenerationConfig:
     jBS_baseline_mode: str = "diff"
     #: Which channel absorbs the Ip closure in jBS_baseline_mode="ohmic":
     #: "bootstrap" (default) keeps j_inductive exactly as the source diffused it
-    #: and rescales j_BS; "ohmic" rescales j_inductive instead (shape preserved).
-    #: Bootstrap is the default because it preserves the source's core current --
-    #: closure on j_ohmic hollows the core and lifts q_min against the measured
-    #: value whenever the recomputed bootstrap fraction is far above the source's.
-    #: Run both channels to bracket the closure uncertainty.
+    #: and rescales j_BS; "ohmic" is DEPRECATED (diagnostic bracket only; emits a
+    #: DeprecationWarning): rescaling j_inductive alone hollows the core, lifts
+    #: q0 far above the source's, loses the q=1 surface on most sawtoothing
+    #: slices and yields implausible Delta' -- never feed it to a stability code.
+    #: RECOMMENDED for sawtoothing discharges: "sawtooth_bootstrap" (below) --
+    #: it is never worse than "bootstrap" (it degenerates to it wherever the
+    #: recomputed bootstrap has no core content, e.g. the early ramp), holds q0
+    #: within ~0.01 of the source's through flattop and ramp-down where
+    #: "bootstrap" drifts by several times that, reproduces the q=1 surface far
+    #: more often, and costs at most one extra solve.  The code default stays
+    #: "bootstrap" until a mid-radius constraint exists for the high-beta_p
+    #: regime (both channels flag closure_limited there -- see ip_closure).
+    #: Every channel records a closure-health block in Baseline.ip_closure
+    #: (raw_components_ip_mismatch_pct, f_BS_unscaled/closed, closure_limited +
+    #: reasons): a slice is closure-limited when the raw components miss Ip by
+    #: >10 % or the bootstrap is scaled below 0.5 -- treat its current split, and
+    #: any Delta' built on it, as unvalidated regardless of channel.
     #: "sawtooth_bootstrap" is "bootstrap" plus a q0 constraint: on a sawtoothing
     #: flattop q0 ~ 1 is a robust physical fact, and the plain bootstrap channel
     #: has nothing holding q0 in place (a large s_bs down-scale removes the CORE
@@ -411,10 +423,14 @@ class GenerationConfig:
     #: closure_channel="sawtooth_bootstrap" gate: the q0 pin is only well-founded
     #: where sawteeth justify it.  Admitted when the source's sawtooth model is
     #: active at the slice (core_sources identifier index 701 carrying non-zero
-    #: j_parallel) OR the reference q0 is at/below this value; otherwise the slice
-    #: falls back to the plain "bootstrap" channel with a printed note (never
-    #: silently -- on reversed shear / early ramp the source's own q0 is
-    #: model-dependent and pinning to it is not obviously better than bootstrap).
+    #: j_parallel) OR the source's OWN axis |q0_dd| is at/below this value;
+    #: otherwise the slice falls back to the plain "bootstrap" channel with a
+    #: printed note (never silently -- on reversed shear / early ramp the
+    #: source's own q0 is model-dependent and pinning to it is not obviously
+    #: better than bootstrap).  The comparison is on |q0_dd|, not on q0_target:
+    #: the TokaMaker-estimator target reads systematically lower and gating on
+    #: it admitted idle-sawtooth ramp slices; q0_target is used only when the
+    #: source carries no axis q (recorded as q0_gate_basis).
     q0_gate: float = 1.1
     #: Absolute q0 acceptance for closure_channel="sawtooth_bootstrap".  The
     #: predictor is first-order (q0 ~ 1/j_phi(0) at frozen geometry); if the

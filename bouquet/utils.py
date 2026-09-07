@@ -704,8 +704,8 @@ def unrenormalise_q0(q0_anchor, j_achieved0, j_requested0):
 
     ``solve_jphi`` hands TokaMaker a jphi-linterp *shape* and TokaMaker
     renormalises it to ``Ip_target``.  When the source's total does not itself
-    carry Ip (FUSE's ``core_profiles`` total reads -3.89 % on the 148798
-    reference slice) the anchor equilibrium therefore sits at a current the
+    carry Ip (FUSE's ``core_profiles`` total reads -3.89 % on the reference
+    validation slice) the anchor equilibrium therefore sits at a current the
     source never claimed, and its ``q0`` with it.  Undo that to the same first
     order the whole predictor runs on -- ``q0 ~ 1/j_phi(0)`` at frozen
     geometry:
@@ -735,6 +735,89 @@ def unrenormalise_q0(q0_anchor, j_achieved0, j_requested0):
                            "current density; q0 cannot be un-renormalised "
                            "onto it")
     return q0_anchor * (j_a / j_r)
+
+
+def q0_gate_admits(sawtooth_active, q0_dd, q0_target, q0_gate):
+    """``(admitted, basis)`` for the ``"sawtooth_bootstrap"`` gate.
+
+    The q0 pin is well-founded where sawteeth justify it: admitted when the
+    source's sawtooth model is ACTIVE at the slice, or when the source's OWN
+    axis safety factor ``|q0_dd|`` is at/below ``q0_gate``.  The comparison is
+    on the source's ``q0_dd`` -- the physically clamped value -- and not on
+    ``q0_target`` (the TokaMaker-estimator mapping of it): the estimator
+    reads systematically lower, and gating on it admitted idle-sawtooth
+    ramp slices whose own ``q0_dd`` (1.10-1.19) sat above the threshold.
+    ``q0_target`` is used only when the source carries no axis q at all,
+    and the returned ``basis`` says which was used.  Magnitudes throughout:
+    q carries a COCOS sign and a negative value would pass ``<= gate``
+    trivially.
+    """
+    if sawtooth_active:
+        return True, "sawtooth active"
+    if q0_dd is not None and np.isfinite(q0_dd):
+        return bool(abs(float(q0_dd)) <= float(q0_gate)), "|q0_dd|"
+    if q0_target is not None and np.isfinite(q0_target):
+        return bool(abs(float(q0_target)) <= float(q0_gate)), \
+            "|q0_target| (source carries no axis q)"
+    return False, "no q0 available"
+
+
+def closure_health(ohm_scale, bs_scale, Ip_target_signed, c_affine,
+                   ip_ind, ip_bs, ip_fix,
+                   mismatch_max_pct=10.0, bs_scale_min=0.5):
+    """Per-slice closure-health record for every ohmic-mode channel.
+
+    Ip conservation only says the hybrid components' INTEGRAL is off; a
+    single rescale cannot say where.  So record how far the raw (unscaled)
+    components miss Ip, the unscaled and closed bootstrap fractions, and flag
+    the slice **closure-limited** when the reconciliation asked of one scale
+    is large: raw mismatch beyond ``mismatch_max_pct`` of Ip, or the bootstrap
+    scaled below ``bs_scale_min``.  A refusal (scale outside [0.2, 5], or a
+    singular q0 system) is closure-limited by construction and raises before
+    this is reached.  Downstream consumers (Delta' pipelines) should treat
+    closure-limited slices as unvalidated regardless of channel -- that is
+    the honest boundary of what two scale factors can do.
+    """
+    Ip_t = abs(float(Ip_target_signed))
+    raw = float(ip_ind) + float(ip_bs) + float(ip_fix) + float(c_affine)
+    mismatch_pct = 100.0 * (abs(raw) - Ip_t) / Ip_t
+    f_bs_unscaled = abs(float(ip_bs)) / Ip_t
+    f_bs_closed = abs(float(bs_scale) * float(ip_bs)) / Ip_t
+    reasons = []
+    if abs(mismatch_pct) > float(mismatch_max_pct):
+        reasons.append(f"raw components miss Ip by {mismatch_pct:+.1f}% "
+                       f"(> {float(mismatch_max_pct):g}%)")
+    if float(bs_scale) < float(bs_scale_min):
+        reasons.append(f"bs_scale {float(bs_scale):.3f} < {float(bs_scale_min):g}")
+    return dict(
+        raw_components_ip_mismatch_pct=float(mismatch_pct),
+        f_BS_unscaled=float(f_bs_unscaled),
+        f_BS_closed=float(f_bs_closed),
+        closure_limited=bool(reasons),
+        closure_limited_reasons=tuple(reasons),
+        closure_limited_thresholds=dict(mismatch_max_pct=float(mismatch_max_pct),
+                                        bs_scale_min=float(bs_scale_min)),
+    )
+
+
+def warn_deprecated_channel(channel):
+    """DeprecationWarning for ``closure_channel="ohmic"`` -- diagnostic only.
+
+    Kept selectable for bracketing studies, but never for production or for
+    anything that feeds a stability code: rescaling j_inductive alone hollows
+    the core, lifts q0 well above the source's (1.3-2.6 measured), loses the
+    q=1 surface on most sawtoothing slices, and produces implausible Delta'.
+    Use ``"sawtooth_bootstrap"`` (sawtoothing discharges) or ``"bootstrap"``.
+    """
+    if str(channel) == "ohmic":
+        import warnings
+        msg = ("closure_channel='ohmic' is DEPRECATED (diagnostic bracket "
+               "only): rescaling j_inductive alone hollows the core and lifts "
+               "q0 far above the source's, drops the q=1 surface and gives "
+               "implausible Delta'. Use 'sawtooth_bootstrap' (sawtoothing "
+               "discharges) or 'bootstrap'. Do not feed its output to GPEC.")
+        print(f"[imas SWB-split:ohmic] WARNING: {msg}", flush=True)
+        warnings.warn(msg, DeprecationWarning, stacklevel=2)
 
 
 def close_ip_q0(Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
