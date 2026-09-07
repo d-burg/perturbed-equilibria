@@ -699,6 +699,194 @@ def close_ip(channel, Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
     return scales
 
 
+def unrenormalise_q0(q0_anchor, j_achieved0, j_requested0):
+    r"""The anchor's q0 mapped back onto the source's OWN current.
+
+    ``solve_jphi`` hands TokaMaker a jphi-linterp *shape* and TokaMaker
+    renormalises it to ``Ip_target``.  When the source's total does not itself
+    carry Ip (FUSE's ``core_profiles`` total reads -3.89 % on the reference
+    validation slice) the anchor equilibrium therefore sits at a current the
+    source never claimed, and its ``q0`` with it.  Undo that to the same first
+    order the whole predictor runs on -- ``q0 ~ 1/j_phi(0)`` at frozen
+    geometry:
+
+    .. math:: q_{0,\mathrm{target}} = q_{0,\mathrm{anchor}}
+              \; j_{\mathrm{achieved}}(0) / j_{\mathrm{requested}}(0)
+
+    where *j_achieved0* is the anchor's GS-reconstructed own axis current
+    (:func:`eq_jphi_profile`, which round-trips to its achieved Ip) and
+    *j_requested0* the source total at the same psi_pad-clipped axis sample.
+
+    A named function rather than three inline characters because this is the
+    one place the Ip-deficit artefact is deliberately NOT propagated into the
+    current split: every other channel absorbs that deficit into a single
+    scale and leaves the shape alone, and this keeps the q0 channel consistent
+    with them.  Raises ``RuntimeError`` on a zero or non-finite requested axis
+    current, where the ratio is meaningless.
+    """
+    q0_anchor = float(q0_anchor)
+    j_a, j_r = float(j_achieved0), float(j_requested0)
+    if not (np.isfinite(q0_anchor) and np.isfinite(j_a) and np.isfinite(j_r)):
+        raise RuntimeError("unrenormalise_q0: non-finite input "
+                           f"(q0_anchor={q0_anchor!r}, j_achieved0={j_a!r}, "
+                           f"j_requested0={j_r!r})")
+    if j_r == 0.0:
+        raise RuntimeError("unrenormalise_q0: the source total has zero axis "
+                           "current density; q0 cannot be un-renormalised "
+                           "onto it")
+    return q0_anchor * (j_a / j_r)
+
+
+def q0_gate_admits(sawtooth_active, q0_dd, q0_target, q0_gate):
+    """``(admitted, basis)`` for the ``"sawtooth_bootstrap"`` gate.
+
+    The q0 pin is well-founded where sawteeth justify it: admitted when the
+    source's sawtooth model is ACTIVE at the slice, or when the source's OWN
+    axis safety factor ``|q0_dd|`` is at/below ``q0_gate``.  The comparison is
+    on the source's ``q0_dd`` -- the physically clamped value -- and not on
+    ``q0_target`` (the TokaMaker-estimator mapping of it): the estimator
+    reads systematically lower, and gating on it admitted idle-sawtooth
+    ramp slices whose own ``q0_dd`` (1.10-1.19) sat above the threshold.
+    ``q0_target`` is used only when the source carries no axis q at all,
+    and the returned ``basis`` says which was used.  Magnitudes throughout:
+    q carries a COCOS sign and a negative value would pass ``<= gate``
+    trivially.
+    """
+    if sawtooth_active:
+        return True, "sawtooth active"
+    if q0_dd is not None and np.isfinite(q0_dd):
+        return bool(abs(float(q0_dd)) <= float(q0_gate)), "|q0_dd|"
+    if q0_target is not None and np.isfinite(q0_target):
+        return bool(abs(float(q0_target)) <= float(q0_gate)), \
+            "|q0_target| (source carries no axis q)"
+    return False, "no q0 available"
+
+
+def closure_health(ohm_scale, bs_scale, Ip_target_signed, c_affine,
+                   ip_ind, ip_bs, ip_fix,
+                   mismatch_max_pct=10.0, bs_scale_min=0.5):
+    """Per-slice closure-health record for every ohmic-mode channel.
+
+    Ip conservation only says the hybrid components' INTEGRAL is off; a
+    single rescale cannot say where.  So record how far the raw (unscaled)
+    components miss Ip, the unscaled and closed bootstrap fractions, and flag
+    the slice **closure-limited** when the reconciliation asked of one scale
+    is large: raw mismatch beyond ``mismatch_max_pct`` of Ip, or the bootstrap
+    scaled below ``bs_scale_min``.  A refusal (scale outside [0.2, 5], or a
+    singular q0 system) is closure-limited by construction and raises before
+    this is reached.  Downstream consumers (Delta' pipelines) should treat
+    closure-limited slices as unvalidated regardless of channel -- that is
+    the honest boundary of what two scale factors can do.
+    """
+    Ip_t = abs(float(Ip_target_signed))
+    raw = float(ip_ind) + float(ip_bs) + float(ip_fix) + float(c_affine)
+    mismatch_pct = 100.0 * (abs(raw) - Ip_t) / Ip_t
+    f_bs_unscaled = abs(float(ip_bs)) / Ip_t
+    f_bs_closed = abs(float(bs_scale) * float(ip_bs)) / Ip_t
+    reasons = []
+    if abs(mismatch_pct) > float(mismatch_max_pct):
+        reasons.append(f"raw components miss Ip by {mismatch_pct:+.1f}% "
+                       f"(> {float(mismatch_max_pct):g}%)")
+    if float(bs_scale) < float(bs_scale_min):
+        reasons.append(f"bs_scale {float(bs_scale):.3f} < {float(bs_scale_min):g}")
+    return dict(
+        raw_components_ip_mismatch_pct=float(mismatch_pct),
+        f_BS_unscaled=float(f_bs_unscaled),
+        f_BS_closed=float(f_bs_closed),
+        closure_limited=bool(reasons),
+        closure_limited_reasons=tuple(reasons),
+        closure_limited_thresholds=dict(mismatch_max_pct=float(mismatch_max_pct),
+                                        bs_scale_min=float(bs_scale_min)),
+    )
+
+
+def warn_deprecated_channel(channel):
+    """DeprecationWarning for ``closure_channel="ohmic"`` -- diagnostic only.
+
+    Kept selectable for bracketing studies, but never for production or for
+    anything that feeds a stability code: rescaling j_inductive alone hollows
+    the core, lifts q0 well above the source's (1.3-2.6 measured), loses the
+    q=1 surface on most sawtoothing slices, and produces implausible Delta'.
+    Use ``"sawtooth_bootstrap"`` (sawtoothing discharges) or ``"bootstrap"``.
+    """
+    if str(channel) == "ohmic":
+        import warnings
+        msg = ("closure_channel='ohmic' is DEPRECATED (diagnostic bracket "
+               "only): rescaling j_inductive alone hollows the core and lifts "
+               "q0 far above the source's, drops the q=1 surface and gives "
+               "implausible Delta'. Use 'sawtooth_bootstrap' (sawtoothing "
+               "discharges) or 'bootstrap'. Do not feed its output to GPEC.")
+        print(f"[imas SWB-split:ohmic] WARNING: {msg}", flush=True)
+        warnings.warn(msg, DeprecationWarning, stacklevel=2)
+
+
+def close_ip_q0(Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
+                j_ind0, j_bs0, j_fix0, j_ref0,
+                scale_bounds=(0.2, 5.0), det_rtol=1e-6):
+    r"""Both hybrid scales from Ip **and** an on-axis-current (q0) constraint.
+
+    The ``"sawtooth_bootstrap"`` channel's predictor.  Two unknowns
+    (``s_ohm``, ``s_bs``), two targets, one 2x2 linear system and **no GS
+    solve**:
+
+    .. code-block:: text
+
+        s_ohm*j_ind0 + s_bs*j_bs0 = j_ref0 - j_fix0      (axis current -> q0)
+        s_ohm*ip_ind + s_bs*ip_bs = Ip_signed - c - ip_fix   (exact Ip, affine)
+
+    The first row is the q0 constraint *linearised*: at frozen anchor geometry
+    (kappa0, B0, R0 fixed with the snapshot) the on-axis safety factor is
+    ``q0 = 2 B0 (1 + kappa0^2) / (2 kappa0 mu0 R0 j0)``, i.e. ``q0 ~ 1/j0``, so
+    matching q0 to the reference equilibrium is -- to first order -- matching
+    its on-axis toroidal current density ``j_ref0``.  All the ``j*0`` are the
+    profile values at the SAME psi_N sample, the psi_pad-clipped axis of
+    :func:`fsa_current_geometry` (never psi_N = 0 exactly; see that docstring's
+    collapse trap).  The second row is untouched from :func:`close_ip`: the
+    LINEAR parts of the affine FSA measure with the P' term ``c`` carried once,
+    so Ip stays exact by construction wherever this succeeds.
+
+    Degenerate by design where the recomputed bootstrap has no core content:
+    ``j_bs0 ~ 0`` makes row 1 pin ``s_ohm = (j_ref0 - j_fix0)/j_ind0`` (~1 when
+    the source's own axis current is reproduced) and row 2 hand the whole Ip
+    deficit to ``s_bs`` -- the channel reduces to ``"bootstrap"`` at zero cost.
+    That is not the singular case; the singular case is the two rows becoming
+    proportional, which is refused against a RELATIVE determinant floor
+    (``det_rtol``) rather than an absolute one, because ``ip_*`` are amps and
+    ``j*0`` are A/m^2 and no absolute epsilon is meaningful across both.
+
+    Raises ``RuntimeError`` on a singular system, on non-finite inputs, or when
+    either scale leaves ``scale_bounds`` -- the three sources then simply do not
+    admit a common (Ip, q0) solution, which is a finding to report, not
+    something to hide behind a rescale.  Returns ``(ohm_scale, bs_scale)``.
+    """
+    vals = (Ip_target_signed, c_affine, ip_ind, ip_bs, ip_fix,
+            j_ind0, j_bs0, j_fix0, j_ref0)
+    if not all(np.isfinite(float(v)) for v in vals):
+        raise RuntimeError("close_ip_q0: non-finite input "
+                           f"{tuple(float(v) for v in vals)}")
+    b_axis = float(j_ref0) - float(j_fix0)
+    b_ip = float(Ip_target_signed) - float(c_affine) - float(ip_fix)
+    det = float(j_ind0) * float(ip_bs) - float(j_bs0) * float(ip_ind)
+    floor = det_rtol * max(abs(float(j_ind0)), abs(float(j_bs0))) \
+        * max(abs(float(ip_ind)), abs(float(ip_bs)))
+    if abs(det) <= floor:
+        raise RuntimeError(
+            f"close_ip_q0: singular 2x2 (det {det:.4e} <= relative floor "
+            f"{floor:.4e}) -- the inductive and bootstrap components are "
+            "proportional in (axis current, Ip); Ip and q0 cannot both be "
+            "imposed on this split")
+    ohm_scale = (b_axis * float(ip_bs) - b_ip * float(j_bs0)) / det
+    bs_scale = (float(j_ind0) * b_ip - float(ip_ind) * b_axis) / det
+    lo, hi = scale_bounds
+    for name, s in (("ohm_scale", ohm_scale), ("bs_scale", bs_scale)):
+        if not (lo < s < hi):
+            raise RuntimeError(
+                f"close_ip_q0: {name} {s:.3f} is outside [{lo:g}, {hi:g}] -- "
+                "no (Ip, q0)-consistent split exists within the scale bounds; "
+                "refusing to hide that behind a rescale")
+    return ohm_scale, bs_scale
+
+
 def Ip_fsa_integral(eq, psi_N, j_profile, convention="jphi-linterp",
                     psi_pad=_FSA_PSI_PAD, pprime_sign=1.0, geom=None):
     r"""Plasma current [A] carried by a bouquet current profile.

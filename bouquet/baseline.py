@@ -81,6 +81,17 @@ class Baseline:
     # error on the FUSE total, and the jphi_diff anchor that was NOT applied.
     ip_closure: Optional[dict] = None
 
+    # IMAS path only: the two slice-level facts closure_channel=
+    # "sawtooth_bootstrap" gates on, read ONCE at load time because the reader
+    # does not retain the (100s of MB) dd -- the source's sawtooth model
+    # amplitude at this slice (core_sources source with identifier index 701)
+    # and the dd's OWN on-axis q from equilibrium.profiles_1d.q.  The latter is
+    # recorded for comparison only: the closure's reference is TokaMaker's q0
+    # for the source total re-solved on the anchor, not the dd's own estimator
+    # (issue #20 -- never compare two estimators of the same name).
+    # Keys: source_index, present, j_par_max_abs, active, q0_dd.
+    sawtooth: Optional[dict] = None
+
     # Case-B ("diff") fixed bootstrap correction profile [A/m^2] = FUSE_jBS - SWB,
     # added to the baseline AND every draw's j_phi so the total anchors to the
     # FUSE bootstrap while the SWB delta tracks per-draw kinetics. None => not in
