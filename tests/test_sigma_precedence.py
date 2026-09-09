@@ -38,15 +38,18 @@ def _write_ida(path, nr=32):
     ne = 5e19 * (1 - 0.8 * psi ** 2)
     te = 3000.0 * (1 - 0.9 * psi ** 2) + 50.0
     ti = 0.9 * te
+    zeff = 1.0 + 0.8 * psi
+    nc = 5e18 * (1 - 0.7 * psi ** 2)          # ni_source needs the carbon channel
     with h5py.File(path, "w") as f:
         f["time"] = np.array([3000.0])
         f["psi_n"] = psi
         for k, v in [("n_e", ne), ("T_e", te), ("T_12C6", ti),
-                     ("Zeff", 1.0 + 0.8 * psi)]:
+                     ("Zeff", zeff), ("n_12C6", nc)]:
             f[k] = np.stack([v])
         for k, v in [("n_e_err", _IDA_FRAC["ne"] * ne),
                      ("T_e_err", _IDA_FRAC["te"] * te),
-                     ("T_12C6_err", _IDA_FRAC["ti"] * ti)]:
+                     ("T_12C6_err", _IDA_FRAC["ti"] * ti),
+                     ("Zeff_err", 0.10 * zeff), ("n_12C6_err", 0.05 * nc)]:
             f[k] = np.stack([v])
     return psi
 

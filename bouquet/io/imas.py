@@ -220,24 +220,34 @@ def _read_ida_omega(path, time_s, psi_N):
         return None
 
 
-def _merge_ida_kinetics(psi_N, ne_fuse, ni_fuse, Zeff_fuse, ida_path, time, impurity_Z):
-    """IDA-hybrid kinetics: replace FUSE ne/Te/Ti (+omega) with IDA fits, resampled
-    onto the FUSE ``psi_N`` grid (single-grid; keeps psi_N == psi_N_kinetic).
+def _merge_ida_kinetics(psi_N, ne_fuse, ni_fuse, Zeff_fuse, ida_path, time, impurity_Z,
+                         ni_source="all", ni_from_imas_Zeff=False, zeff_from_fuse=False):
+    """IDA-hybrid kinetics: replace FUSE ne/ni/Te/Ti/Zeff (+omega) with IDA fits,
+    resampled onto the FUSE ``psi_N`` grid (psi_N == psi_N_kinetic).
 
-    Z_eff stays FUSE (IDA's reported Z_eff is internally inconsistent with its own
-    carbon density), and ni is re-derived from the FUSE Z_eff under single-impurity
-    quasineutrality applied to the IDA electron density. Returns
-    ``(ne, te, ti, ni, omega_tor_or_None)``.
+    Zeff and ni both default to IDA: Zeff measured directly (``zeff_from_fuse=True``
+    keeps the FUSE Zeff instead); ni via ``ni_source`` ("Zeff"/"CER"/"all", with
+    Jacobian-propagated sigma_ni -- see :func:`bouquet.io.ida.read_ida`). The
+    "Zeff"/"all" dilution always uses IDA's own Zeff regardless of
+    ``zeff_from_fuse``. ``ni_from_imas_Zeff`` forces ni from the FUSE ``Zeff_fuse`` 
+    without updating sigma_ni.
+
+    Returns ``(ne, te, ti, ni, zeff, omega_or_None, sigma_ne, sigma_te, sigma_ni,
+    sigma_ti)`` on ``psi_N``.
     """
     from .ida import read_ida
-    ida = read_ida(ida_path, time=time, impurity_Z=impurity_Z)
+    ida = read_ida(ida_path, time=time, impurity_Z=impurity_Z, ni_source=ni_source)
     _ipsi = np.asarray(ida.psi_N, dtype=float)
     g = lambda a: np.interp(psi_N, _ipsi, np.asarray(a, dtype=float))
-    ne, te, ti = g(ida.ne), g(ida.te), g(ida.ti)
-    # ni from FUSE Z_eff + IDA ne (single-impurity dilution; Z_imp = machine charge)
-    ni = main_ion_density_from_zeff(ne, np.clip(Zeff_fuse, 1.0, impurity_Z), impurity_Z)
+    ne, ni, te, ti = g(ida.ne), g(ida.ni), g(ida.te), g(ida.ti)
+    zeff = np.asarray(Zeff_fuse, dtype=float) if zeff_from_fuse else g(ida.Zeff)
+    sigma_ne, sigma_te, sigma_ni, sigma_ti = (
+        g(ida.sigma_ne), g(ida.sigma_te), g(ida.sigma_ni), g(ida.sigma_ti))
+    if ni_from_imas_Zeff:
+        # ni from FUSE Z_eff + IDA ne (single-impurity dilution; Z_imp = machine charge)
+        ni = main_ion_density_from_zeff(ne, np.clip(Zeff_fuse, 1.0, impurity_Z), impurity_Z)
     omega = _read_ida_omega(ida_path, time, psi_N)
-    return ne, te, ti, ni, omega
+    return ne, te, ti, ni, zeff, omega, sigma_ne, sigma_te, sigma_ni, sigma_ti
 
 
 def read_imas_baseline(
@@ -349,15 +359,26 @@ def read_imas_baseline(
             if "d" in ctsl.get("total_ion_energy", {}):
                 aux["chi_i"] = np.asarray(ctsl["total_ion_energy"]["d"], dtype=float)
 
-    # --- IDA-hybrid: swap FUSE ne/Te/Ti/omega for externally-fit IDA profiles -----
-    # Z_eff/ni-dilution stay FUSE; p_fast/currents/equilibrium/anchors stay FUSE.
-    # Done before the pressure block so p_recon/Z_imp/p_imp use the IDA kinetics.
-    if kinetic_source == "ida_hybrid" and getattr(source, "ida_path", None):
-        ne, te, ti, ni, _omega = _merge_ida_kinetics(
+    # --- IDA-hybrid: swap FUSE ne/Te/Ti/Zeff/omega for externally-fit IDA profiles ---
+    # ni via source.ni_source; Zeff from IDA unless source.zeff_from_fuse. Done
+    # before the pressure block so p_recon/Z_imp/p_imp use the IDA kinetics. IDA
+    # sigmas land in aux as sigma_*_ida (informational -- resolve_uncertainty still
+    # needs UncertaintyConfig.ida_path for the actual generation envelope).
+    use_ida = bool(kinetic_source == "ida_hybrid" and getattr(source, "ida_path", None))
+    if use_ida:
+        (ne, te, ti, ni, Zeff, _omega,
+         sigma_ne_ida, sigma_te_ida, sigma_ni_ida, sigma_ti_ida) = _merge_ida_kinetics(
             psi_N, ne, ni, Zeff, source.ida_path, T,
-            getattr(source, "impurity_Z", 6.0))
+            getattr(source, "impurity_Z", 6.0),
+            ni_source=getattr(source, "ni_source", "all"),
+            zeff_from_fuse=getattr(source, "zeff_from_fuse", False))
         if _omega is not None:
             aux["omega_tor"] = _omega
+        aux["zeff"] = Zeff   # keep the switchboard's zeff baseline consistent
+        aux["sigma_ne_ida"] = sigma_ne_ida
+        aux["sigma_te_ida"] = sigma_te_ida
+        aux["sigma_ni_ida"] = sigma_ni_ida
+        aux["sigma_ti_ida"] = sigma_ti_ida
 
     # --- user overrides for fixed additive components ---
     if fixed is not None:
@@ -386,7 +407,11 @@ def read_imas_baseline(
     _o = np.argsort(psiN_eq)
     p_equilibrium = np.interp(psi_N, psiN_eq[_o],
                               np.asarray(eqp1["pressure"], dtype=float)[_o])
-    Z_imp = effective_impurity_charge(ne, ni, Zeff)
+    # With IDA-hybrid kinetics, ni was built (read_ida / main_ion_density_from_zeff)
+    # under single-impurity quasineutrality at charge source.impurity_Z, so that IS
+    # the impurity charge.
+    Z_imp = (float(getattr(source, "impurity_Z", 6.0)) if use_ida
+             else effective_impurity_charge(ne, ni, Zeff))
     p_imp = impurity_pressure(ne, ni, ti, Z_imp)
     p_recon = _EC * (ne * te + ni * ti) + p_imp + p_fast
     # p_diff anchors the solve thermal pressure to the FUSE equilibrium.pressure.
