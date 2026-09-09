@@ -43,7 +43,7 @@ def _write_direct(path, nr=32):
         for k, v in [("n_e", ne), ("T_e", te), ("T_12C6", ti), ("Zeff", zeff)]:
             f[k] = np.stack([v, v])                       # (n_time, n_radial)
         for k, v in [("n_e_err", 0.05 * ne), ("T_e_err", 0.04 * te),
-                     ("T_12C6_err", 0.06 * ti)]:
+                     ("T_12C6_err", 0.06 * ti), ("Zeff_err", 0.10 * zeff)]:
             f[k] = np.stack([v, v])
         cer = _cer_values(psi)
         for k, v in cer.items():

@@ -93,6 +93,11 @@ class ReconstructionSource:
     e.g. tungsten ~ 74 (use the effective radiating charge if W is not fully
     stripped), beryllium 4, neon 10. For a p-file this is informational: the
     Osborne ``N Z A`` footer carries the species directly and is authoritative.
+
+    ``ni_source`` picks the IDA main-ion density route: ``"Zeff"``
+    (single-impurity quasineutrality), ``"CER"`` (``ni = max(ne - Z_imp n_C, 0)``
+    from the measured ``n_12C6``), or ``"all"`` (default, the mean of the two). 
+    The two routes are independent measurements and may disagree. Ignored for p-files.
     """
 
     geqdsk_path: str
@@ -100,6 +105,7 @@ class ReconstructionSource:
     cocos: int = 1
     time: Optional[float] = None       # IDA time slice [s] (multi-time .cdf files)
     impurity_Z: float = 6.0            # effective impurity charge (carbon); set per machine
+    ni_source: str = "all"             # IDA path: "Zeff" | "CER" (n_12C6) | "all" (mean)
     profile_overrides: dict = field(default_factory=dict)  # name -> array, manual override
     # reconstruction knobs
     psi_pad: float = 1e-3
@@ -123,15 +129,16 @@ class ImasSource:
     ids_path: str                      # IMAS/OMAS file (FUSE output)
     time: Optional[float] = None       # time slice [s]; None -> single/first slice
     # --- IDA-hybrid kinetics (GenerationConfig.kinetic_source = "ida_hybrid") ---
-    # When set, the baseline ne/Te/Ti/omega_tor are taken from this IDA .cdf
-    # (externally fit, smoother across time than FUSE's per-slice profile fits),
-    # resampled onto the FUSE core_profiles psi_N grid. Z_eff / Z_imp / the ni
-    # dilution stay FUSE (IDA's reported Z_eff is unreliable -- internally
-    # inconsistent with its own carbon density). Everything else (currents,
-    # equilibrium, p_fast, anchors) stays FUSE. Also wire it to
-    # UncertaintyConfig.ida_path so the sigma envelopes come from the same IDA.
+    # ne/Te/Ti/Zeff/omega_tor come from this IDA .cdf, resampled onto the FUSE
+    # core_profiles psi_N grid; everything else (currents, equilibrium, p_fast,
+    # anchors) stays FUSE. Zeff is IDA's own unless zeff_from_fuse=True; ni comes
+    # from IDA via ni_source below (dilution always uses IDA's own Zeff). IDA
+    # sigmas land in Baseline.aux as sigma_{ne,te,ni,ti}_ida (informational --
+    # also set UncertaintyConfig.ida_path = ida_path for the actual envelope).
     ida_path: Optional[str] = None
     impurity_Z: float = 6.0            # machine impurity charge (carbon); ni dilution
+    ni_source: str = "all"             # IDA ni route for ida_hybrid: "Zeff" | "CER" | "all"
+    zeff_from_fuse: bool = False       # ida_hybrid: keep FUSE Z_eff instead of IDA's
     # OPTIONAL. A gEQDSK whose LCFS replaces the dd boundary outline as the
     # isoflux separatrix target. Leave None to use the source's own boundary.
     # Supply one when you have a more accurate separatrix for the slice than the
@@ -244,7 +251,6 @@ class UncertaintyConfig:
     ida_path: Optional[str] = None
     sigma_mode: str = "auto"               # "auto" (by dim) | "direct" (*_err) | "ensemble"
     sigma_method: str = "percentile"       # "percentile" | "std"  (ensemble only)
-    sigma_ni_from_ne: bool = True          # IDA path only: sigma_ni = sigma_ne
 
     # flat fractional kinetic sigma envelopes (per channel). ni/Ti default wider
     # than ne/Te -- ion density and temperature are harder to diagnose.
@@ -274,6 +280,17 @@ class UncertaintyConfig:
     # Set 0.0 to disable (Z_eff held at baseline, ni drawn independently).
     # An explicit aux_sigmas['zeff'] always overrides this.
     zeff_scalar_sigma: float = 0.05
+
+    # Who draws ni when the zeff channel is active. True: ni is DERIVED per draw
+    # from the drawn (ne, Zeff) by quasineutrality and sigma_ni is unused (one
+    # mutually consistent ne/ni/Zeff/nz set per draw). False: ni is drawn from
+    # its own sigma_ni -- use this when sigma_ni is a real measured envelope (an
+    # IDA ni_source route), at the cost of ni and Zeff no longer being mutually
+    # consistent within a draw. None (default) = auto: False whenever the ni
+    # channel resolved to a real envelope (IDA or explicit sigma_profiles['ni']),
+    # True when sigma_ni is only the flat ni_scalar_sigma fallback. Zeff is
+    # perturbed and drives the bootstrap either way.
+    ni_from_zeff: Optional[bool] = None
 
     # GPR correlation length scales (psi_N units) -- define the perturbation
     n_ls: float = 0.5                      # density

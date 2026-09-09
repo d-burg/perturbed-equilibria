@@ -1632,6 +1632,7 @@ def perturb_kinetic_equilibrium(
     aux_sigmas=None,
     aux_baselines=None,
     aux_length_scales=None,
+    ni_from_zeff=True,
     max_proxy_draws=500,
     bnd_diag_callback=None,
     # Differential bootstrap (DIFF_BS=1 mode):
@@ -1863,15 +1864,23 @@ def perturb_kinetic_equilibrium(
     # one mutually consistent (ne, ni, Zeff, nz) set per draw, used by the
     # bootstrap, the archived profiles, and the per-draw p-file alike.
     # sigma_ni is not used in this mode. See physics.main_ion_density_from_zeff.
-    _zeff_active = bool(aux_sigmas) and ('zeff' in aux_sigmas) \
+    # ni_from_zeff=False opts out (ni drawn from its own sigma_ni, e.g. a
+    # measured IDA ni_source envelope); Zeff is still drawn below as a normal
+    # aux channel, bounded by the same Z_imp, and drives the bootstrap either way.
+    _zeff_chan = bool(aux_sigmas) and ('zeff' in aux_sigmas) \
         and (aux_baselines or {}).get('zeff') is not None
+    _zeff_active = bool(ni_from_zeff) and _zeff_chan
     _Z_imp = None
     _zeff_draw = None
-    if _zeff_active:
+    if _zeff_chan:
+        # Prefer the baseline's own Z_imp (the charge its ni was actually built
+        # with, e.g. the IDA impurity_Z); invert (ne, ni, Zeff) only if absent.
+        # Resolved for the whole channel, not just the active mode: it also
+        # bounds the passive draw below.
         from .physics import effective_impurity_charge
-        _Z_imp = effective_impurity_charge(
+        _Z_imp = float(Z_imp) if Z_imp else effective_impurity_charge(
             ne, ni, np.asarray(aux_baselines['zeff'], dtype=float))
-        if _Z_imp is None:
+        if _zeff_active and _Z_imp is None:
             print("  [zeff] baseline has no ne-ni dilution (ni ~= ne): Zeff "
                   "draws still drive the bootstrap, but ni remains an "
                   "independent channel")
@@ -1976,6 +1985,11 @@ def perturb_kinetic_equilibrium(
             _ep = np.squeeze(generate_perturbed_GPR(
                 psi_kin, _eb / _e0, _es / _e0, length_scale=_els, n_samples=1,
                 rng=rng)) * _e0
+            if _en == 'zeff':
+                # Same bound as the active path: a draw outside [1, Z_imp] is
+                # outside the single-impurity model that Z_imp / p_imp assume.
+                _ep = np.clip(_ep, 1.0,
+                              None if _Z_imp is None else _Z_imp * (1.0 - 1e-9))
             aux_out[_en] = np.atleast_1d(np.asarray(_ep, dtype=float))
         if _zeff_draw is not None:
             aux_out['zeff'] = _zeff_draw      # the draw ni was derived from
@@ -3361,6 +3375,7 @@ def generate_bouquet(
     aux_sigmas=None,
     aux_baselines=None,
     aux_length_scales=None,
+    ni_from_zeff=True,
     progress_callback=None,
     source_kind=None,
     capture_live_eq=True,
@@ -4558,15 +4573,18 @@ def generate_bouquet(
 
     # One-time notice for the Zeff-primary mode (the per-draw mechanics live
     # in perturb_kinetic_equilibrium; see physics.main_ion_density_from_zeff).
-    if aux_sigmas and 'zeff' in aux_sigmas:
+    # Gate and Z_imp source both mirror that function's _zeff_active branch:
+    # the mode needs a zeff sigma AND a zeff baseline, and uses the baseline's
+    # declared Z_imp when it has one, else inverts (ne, ni, Zeff).
+    if (ni_from_zeff and aux_sigmas and 'zeff' in aux_sigmas
+            and (aux_baselines or {}).get('zeff') is not None):
         from .physics import effective_impurity_charge
-        _zimp_note = effective_impurity_charge(
-            ne, ni, np.asarray((aux_baselines or {}).get('zeff', Zeff),
-                               dtype=float))
+        _zimp_note = float(Z_imp) if Z_imp else effective_impurity_charge(
+            ne, ni, np.asarray(aux_baselines['zeff'], dtype=float))
         if _zimp_note is not None:
             print(f"NOTE: zeff channel active -> ni is DERIVED per draw from "
-                  f"(ne, Zeff) via quasineutrality (Z_imp = {_zimp_note:.2f}); "
-                  f"the independent sigma_ni input is not used.")
+                  f"the drawn (ne, Zeff) via single-impurity quasineutrality "
+                  f"at Z_imp = {_zimp_note:.2f}; sigma_ni is not used.")
 
     t_batch_start = time.perf_counter()
     elapsed_times = []
@@ -4774,6 +4792,7 @@ def generate_bouquet(
                 aux_sigmas=aux_sigmas,
                 aux_baselines=aux_baselines,
                 aux_length_scales=aux_length_scales,
+                ni_from_zeff=ni_from_zeff,
                 max_proxy_draws=max_proxy_draws,
                 p_thresh=p_thresh,
                 # the run's single Generator -- every GPR draw in this draw
