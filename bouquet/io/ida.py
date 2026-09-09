@@ -18,6 +18,8 @@ There is no stored main-ion density; ``ni`` can come from ``Zeff``
 reconstructed from visible bremsstrahlung data (``ni_source="Zeff"``), from
 the measured carbon density ``n_12C6`` from charge exchange recombination
 (``ni_source="CER"``), or from the mean of the two (``ni_source="all"``, default).
+With both active, their disagreement beyond statistical error widens
+``sigma_ni``.
 """
 
 from __future__ import annotations
@@ -52,6 +54,9 @@ class IDAProfiles:
 
     time: float                     # selected slice [s]
     raw_bytes: Optional[bytes] = None   # original file bytes for archival
+    # Per-radius tension between the two ni routes, in sigma; >1 is what
+    # widens sigma_ni. None unless ni_source="all".
+    ni_route_chi: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -138,6 +143,11 @@ def read_ida(
     Opens with ``h5py.File(path, "r")`` -- the file is netCDF4/HDF5, so no
     OMFIT or netCDF4 package is needed. Units are already SI; ``T_12C6`` maps to
     Ti.
+
+    For ``ni_source="all"``, ``sigma_ni`` also carries what the two routes
+    disagree on beyond their statistical errors. The term is one-sided -- it
+    only widens ``sigma_ni`` -- and ``ni_route_chi`` reports the tension behind
+    it.
     """
     import h5py
 
@@ -248,18 +258,42 @@ def read_ida(
             # is measured, not assumed. Zeff is clipped to [1, Z_imp] so
             # 0 <= ni <= ne.
             Zeff_c = np.clip(Zeff, 1.0, impurity_Z)
-            ni += w * main_ion_density_from_zeff(ne, Zeff_c, impurity_Z)
-            d_ne += w * (impurity_Z - Zeff_c) / (impurity_Z - 1.0)
-            terms.append(w * ne / (impurity_Z - 1.0) * sigma_Zeff)
+            ni_zeff = main_ion_density_from_zeff(ne, Zeff_c, impurity_Z)
+            dne_zeff = (impurity_Z - Zeff_c) / (impurity_Z - 1.0)   # dni/dne
+            sig_zeff = ne / (impurity_Z - 1.0) * sigma_Zeff         # |dni/dZeff| sigma
+            ni += w * ni_zeff
+            d_ne += w * dne_zeff
+            terms.append(w * sig_zeff)
 
         if use_carbon:
             # Dilution straight from the CER carbon density: ni = ne - Z_imp n_C.
-            ni += w * np.maximum(ne - impurity_Z * n_carbon, 0.0)
-            d_ne += w
-            terms.append(w * impurity_Z * sigma_n_carbon)
+            ni_cer = np.maximum(ne - impurity_Z * n_carbon, 0.0)
+            sig_cer = impurity_Z * sigma_n_carbon                   # |dni/dn_C| sigma
+            ni += w * ni_cer
+            d_ne += w                                               # dni/dne = 1
+            terms.append(w * sig_cer)
 
         terms.append(d_ne * sigma_ne)
-        sigma_ni = np.sqrt(sum(t ** 2 for t in terms))
+        var_ni = sum(t ** 2 for t in terms)
+
+        ni_route_chi = None
+        if use_zeff and use_carbon:
+            delta = ni_zeff - ni_cer
+            # ne is shared, so it reaches delta only through the difference of
+            # the two derivatives, not as two independent terms.
+            var_delta = (((dne_zeff - 1.0) * sigma_ne) ** 2
+                         + sig_zeff ** 2 + sig_cer ** 2)
+
+            # Both routes are GP fits, so delta is smooth in psi_N: a nonzero
+            # value is a coherent offset, not point-to-point scatter. max(., 0)
+            # keeps the term one-sided, and ni is the mean of the two routes, so
+            # an offset delta displaces it by delta/2 -> variance excess /4.
+            var_ni = var_ni + np.maximum(delta ** 2 - var_delta, 0.0) / 4.0
+            ni_route_chi = np.sqrt(np.divide(
+                delta ** 2, var_delta, out=np.full_like(delta, np.nan),
+                where=var_delta > 0.0))
+
+        sigma_ni = np.sqrt(var_ni)
 
     return IDAProfiles(
         psi_N=psi_N,
@@ -268,6 +302,7 @@ def read_ida(
         sigma_Zeff=sigma_Zeff,
         time=t_sel,
         raw_bytes=raw_bytes,
+        ni_route_chi=ni_route_chi,
     )
 
 
